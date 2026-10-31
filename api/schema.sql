@@ -1,8 +1,10 @@
 CREATE TABLE IF NOT EXISTS users (
     id         text PRIMARY KEY,
-    container  text NOT NULL UNIQUE,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- The container name follows from the user ID. This line only updates databases created before that.
+ALTER TABLE users DROP COLUMN IF EXISTS container;
 
 CREATE TABLE IF NOT EXISTS artifacts (
     id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -10,7 +12,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     title          text NOT NULL,
     -- Pointer to the current version. The conflict check on publish relies on this column.
     live_version   integer NOT NULL,
-    retention_days integer NOT NULL DEFAULT 30,
+    retention_days integer NOT NULL,
     expires_at     timestamptz NOT NULL,
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),

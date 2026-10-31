@@ -1,4 +1,7 @@
-import type { ArtifactFile } from "./main.js";
+export interface ArtifactFile {
+  path: string;
+  content: string;
+}
 
 export const blankFiles: ArtifactFile[] = [
   {
@@ -58,7 +61,7 @@ function row(name, kind, detail) {
   const tr = table.insertRow();
   tr.insertCell().textContent = name;
   const state = tr.insertCell();
-  state.textContent = kind === "blocked" ? "blocked" : kind === "allowed" ? "ALLOWED" : "info";
+  state.textContent = kind === "allowed" ? "ALLOWED" : kind;
   state.className = kind;
   tr.insertCell().textContent = detail;
 }

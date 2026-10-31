@@ -22,10 +22,7 @@ func newBlobClient(baseURL string) *blobClient {
 }
 
 func (b *blobClient) do(ctx context.Context, method, path string, query url.Values, body io.Reader) (*http.Response, error) {
-	u := b.baseURL + (&url.URL{Path: path}).EscapedPath()
-	if query != nil {
-		u += "?" + query.Encode()
-	}
+	u := b.baseURL + (&url.URL{Path: path, RawQuery: query.Encode()}).String()
 	req, err := http.NewRequestWithContext(ctx, method, u, body)
 	if err != nil {
 		return nil, err
@@ -42,20 +39,21 @@ func (b *blobClient) do(ctx context.Context, method, path string, query url.Valu
 	return resp, nil
 }
 
-func (b *blobClient) createContainer(ctx context.Context, container string) error {
-	resp, err := b.do(ctx, http.MethodPut, "/"+container, nil, nil)
+// send is do for calls that only care whether they succeeded.
+func (b *blobClient) send(ctx context.Context, method, path string, query url.Values, body io.Reader) error {
+	resp, err := b.do(ctx, method, path, query, body)
 	if err != nil {
 		return err
 	}
 	return resp.Body.Close()
 }
 
+func (b *blobClient) createContainer(ctx context.Context, container string) error {
+	return b.send(ctx, http.MethodPut, "/"+container, nil, nil)
+}
+
 func (b *blobClient) put(ctx context.Context, container, name, content string) error {
-	resp, err := b.do(ctx, http.MethodPut, "/"+container+"/"+name, nil, strings.NewReader(content))
-	if err != nil {
-		return err
-	}
-	return resp.Body.Close()
+	return b.send(ctx, http.MethodPut, "/"+container+"/"+name, nil, strings.NewReader(content))
 }
 
 func (b *blobClient) get(ctx context.Context, container, name string) (string, error) {
@@ -79,9 +77,5 @@ func (b *blobClient) list(ctx context.Context, container, prefix string) ([]stri
 }
 
 func (b *blobClient) deletePrefix(ctx context.Context, container, prefix string) error {
-	resp, err := b.do(ctx, http.MethodDelete, "/"+container, url.Values{"prefix": {prefix}}, nil)
-	if err != nil {
-		return err
-	}
-	return resp.Body.Close()
+	return b.send(ctx, http.MethodDelete, "/"+container, url.Values{"prefix": {prefix}}, nil)
 }
