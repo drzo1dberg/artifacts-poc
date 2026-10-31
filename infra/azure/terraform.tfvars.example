@@ -1,6 +1,0 @@
-storage_account_name    = "startifactspoc123"
-content_domain          = "usercontent.example.com"
-app_origin              = "https://app.example.com"
-dns_zone_id             = "/subscriptions/<subscription-id>/resourceGroups/<rg>/providers/Microsoft.Network/dnsZones/example.com"
-key_vault_id            = "/subscriptions/<subscription-id>/resourceGroups/<rg>/providers/Microsoft.KeyVault/vaults/<vault>"
-wildcard_certificate_id = "https://<vault>.vault.azure.net/certificates/<certificate>"

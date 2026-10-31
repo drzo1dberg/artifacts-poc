@@ -138,7 +138,7 @@ docker compose exec postgres psql -U artifacts -c \
 
 ## How this would look on Azure
 
-I have not deployed this. The mapping comes from reading the Microsoft Learn docs in October 2026. The data plane exists as Terraform in `infra/azure`, which passes `terraform validate` but has never run against a real subscription, so treat it as a design sketch.
+I have not deployed this. The mapping comes from reading the Microsoft Learn docs in October 2026. Treat it as a design sketch.
 
 | POC | Azure |
 |---|---|
@@ -160,7 +160,7 @@ The interesting part is what does not map one to one:
 
 **Wildcard domain.** `*.usercontent.example.com` needs a wildcard certificate, which I would keep in Key Vault.
 
-**Caching needs explicit headers.** Without a `Cache-Control` header, Front Door picks a random cache time of one to three days. It also refuses to cache `no-cache`, which the POC sends to browsers. So `infra/azure` sets the edge cache time in a rule and sends `no-cache` to browsers. I have not tested whether Front Door handles that combination the way I expect.
+**Caching needs explicit headers.** Without a `Cache-Control` header, Front Door picks a random cache time of one to three days. It also refuses to cache `no-cache`, which the POC sends to browsers. So the edge cache time needs an explicit rule or a header like `s-maxage=60, max-age=0`.
 
 **Purging is weak, and the design does not need it for publishing.** Purge can take up to 10 minutes and is not directly supported for wildcard domains, so you have to name each subdomain. Microsoft itself recommends versioned URLs for updates, which is what this design does. A real delete is different: a guaranteed quick removal stays an open problem, and a short cache time is the simple answer.
 
@@ -186,30 +186,11 @@ SAS tokens are not always bad. Key-signed SAS tokens are the ones to avoid, beca
 | API | User-assigned managed identity | Storage Blob Data Contributor |
 | Front Door | User-assigned managed identity | Storage Blob Data Reader |
 
-`shared_access_key_enabled = false` removes account keys entirely, so key-signed SAS tokens stop working. Front Door cannot write, because its role does not allow it.
+Turning off Shared Key on the account means key-signed SAS tokens stop working. Front Door cannot write, because its role does not allow it. The API creates the per-user containers at login with its identity.
 
-The tradeoff is that managed identity origin auth does not work with Private Link. The storage account stays reachable over the internet and relies on Entra ID alone. That is why this uses Standard and not Premium.
+The tradeoff is that managed identity origin auth does not work with Private Link. The storage account stays reachable over the internet and relies on Entra ID alone. That is why this would use Standard and not Premium.
 
 **Private artifacts are still unsolved.** In this POC, "private" only applies to the API, and anyone with the URL can read the content. Entra login does not change that, because Front Door reads with its own identity and not the user's. A SAS token would not help either, because it does not carry over to the relative `style.css` and `app.js`. Real access control means putting an authenticated proxy in front of storage, which gives up most of the edge cache.
-
-### Terraform and the Go runner
-
-Terraform owns what exists once per environment. The per-user containers stay in the API, which creates them at login with its managed identity. A Terraform run per login would be slow and would queue on the state lock.
-
-| Path | What it does |
-|---|---|
-| `infra/local` | Runs the simulated storage account in Docker, so you can try the flow without a cloud login |
-| `infra/azure` | Storage, identities and Front Door |
-| `deploy` | Go program that runs Terraform through `terraform-exec` |
-
-```bash
-cd deploy                                 # needs Go 1.26 and the terraform binary
-go run . -dir ../infra/local plan         # saves the plan and shows it
-go run . -dir ../infra/local apply        # applies exactly that plan
-terraform -chdir=../infra/local destroy   # cleans up
-```
-
-`terraform-exec` does not embed Terraform, it starts the binary and returns typed results. So .NET can run Terraform files as well, by starting the same binary with `System.Diagnostics.Process`. Go only has the official library for it.
 
 ## Where this differs from real Claude Artifacts
 
