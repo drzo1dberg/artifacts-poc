@@ -138,16 +138,16 @@ docker compose exec postgres psql -U artifacts -c \
 
 ## How this would look on Azure
 
-I have not deployed this. The mapping comes from reading the Microsoft Learn docs in October 2026, so treat it as a design sketch.
+I have not deployed this. The mapping comes from reading the Microsoft Learn docs in October 2026. Treat it as a design sketch.
 
 | POC | Azure |
 |---|---|
-| nginx | Front Door Premium, because Private Link to a storage origin needs Premium |
-| blobstore | Storage account with public access turned off |
+| nginx | Front Door Standard with managed identity origin auth |
+| blobstore | Storage account with Shared Key and anonymous access turned off |
 | container per user | Blob container, the docs list no limit per account |
 | Go API | Container Apps, with a managed identity for storage access |
 | postgres | Azure Database for PostgreSQL Flexible Server |
-| fake login | Entra ID and a signed session cookie |
+| fake login | Entra ID, assuming all users are internal, and a signed session cookie |
 | retention job | Container Apps job, plus a lifecycle policy as a safety net |
 
 The interesting part is what does not map one to one:
@@ -160,7 +160,7 @@ The interesting part is what does not map one to one:
 
 **Wildcard domain.** `*.usercontent.example.com` needs a wildcard certificate, which I would keep in Key Vault.
 
-**Caching needs explicit headers.** Without a `Cache-Control` header, Front Door picks a random cache time of one to three days. It also refuses to cache `no-cache`, which the POC sends to browsers. So the blobs would need something like `s-maxage=60, max-age=0`.
+**Caching needs explicit headers.** Without a `Cache-Control` header, Front Door picks a random cache time of one to three days. It also refuses to cache `no-cache`, which the POC sends to browsers. So the edge cache time needs an explicit rule or a header like `s-maxage=60, max-age=0`.
 
 **Purging is weak, and the design does not need it for publishing.** Purge can take up to 10 minutes and is not directly supported for wildcard domains, so you have to name each subdomain. Microsoft itself recommends versioned URLs for updates, which is what this design does. A real delete is different: a guaranteed quick removal stays an open problem, and a short cache time is the simple answer.
 
@@ -175,7 +175,22 @@ The interesting part is what does not map one to one:
 
 **Folders are a real decision.** Without hierarchical namespace there are no folders, so deleting an artifact means listing its blobs and deleting them in a batch. With hierarchical namespace you get real folders, but lifecycle rules can no longer filter on blob index tags, because that filter is for flat namespace accounts only.
 
-**Private artifacts are unsolved here.** In this POC, "private" only applies to the API. Anyone with the URL can read the content. A SAS token on the iframe URL would not carry over to the relative `style.css` and `app.js`, so real access control needs more design work.
+**Entra users do not fit into the hostname as they are.** With internal users, the container name could come from the Entra object ID, but that is a 36 character UUID. Two UUIDs plus `--` make 74 characters, and a DNS label allows 63. The API would have to keep a short slug per user in Postgres.
+
+### No SAS tokens
+
+SAS tokens are not always bad. Key-signed SAS tokens are the ones to avoid, because they depend on the account key. Microsoft recommends a user delegation SAS when someone without an identity needs temporary access. This design has no such caller, because every caller can have a managed identity:
+
+| Caller | Identity | Role |
+|---|---|---|
+| API | User-assigned managed identity | Storage Blob Data Contributor |
+| Front Door | User-assigned managed identity | Storage Blob Data Reader |
+
+Turning off Shared Key on the account means key-signed SAS tokens stop working. Front Door cannot write, because its role does not allow it. The API creates the per-user containers at login with its identity.
+
+The tradeoff is that managed identity origin auth does not work with Private Link. The storage account stays reachable over the internet and relies on Entra ID alone. That is why this would use Standard and not Premium.
+
+**Private artifacts are still unsolved.** In this POC, "private" only applies to the API, and anyone with the URL can read the content. Entra login does not change that, because Front Door reads with its own identity and not the user's. A SAS token would not help either, because it does not carry over to the relative `style.css` and `app.js`. Real access control means putting an authenticated proxy in front of storage, which gives up most of the edge cache.
 
 ## Where this differs from real Claude Artifacts
 
