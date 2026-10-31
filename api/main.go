@@ -25,6 +25,8 @@ var schema string
 
 const (
 	defaultRetentionDays = 30
+	janitorInterval      = 10 * time.Second
+	contentTokenTTL      = 15 * time.Minute
 	maxRetentionDays     = 3650
 	maxBodyBytes         = 10 << 20
 	maxFiles             = 64
@@ -41,7 +43,6 @@ type server struct {
 	blob        *blobClient
 	contentHost string
 	tokenKey    []byte
-	tokenTTL    time.Duration
 }
 
 type file struct {
@@ -50,9 +51,14 @@ type file struct {
 }
 
 type version struct {
-	Number    int       `json:"number"`
-	CreatedAt time.Time `json:"created_at"`
-	URL       string    `json:"url"`
+	Number int    `json:"number"`
+	URL    string `json:"url"`
+}
+
+type artifactSummary struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	LiveVersion int    `json:"live_version"`
 }
 
 type artifact struct {
@@ -61,10 +67,8 @@ type artifact struct {
 	LiveVersion   int       `json:"live_version"`
 	RetentionDays int       `json:"retention_days"`
 	ExpiresAt     time.Time `json:"expires_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
 	BlobPrefix    string    `json:"blob_prefix"`
-	URL           string    `json:"url"`
-	Versions      []version `json:"versions,omitempty"`
+	Versions      []version `json:"versions"`
 }
 
 func main() {
@@ -76,18 +80,9 @@ func main() {
 	if _, err := db.Exec(ctx, schema); err != nil {
 		log.Fatal("apply schema: ", err)
 	}
-	interval, err := time.ParseDuration(os.Getenv("JANITOR_INTERVAL"))
-	if err != nil {
-		log.Fatal("JANITOR_INTERVAL: ", err)
-	}
-
 	tokenKey := os.Getenv("CONTENT_TOKEN_KEY")
 	if tokenKey == "" {
 		log.Fatal("CONTENT_TOKEN_KEY is required")
-	}
-	tokenTTL, err := time.ParseDuration(os.Getenv("CONTENT_TOKEN_TTL"))
-	if err != nil {
-		log.Fatal("CONTENT_TOKEN_TTL: ", err)
 	}
 
 	s := &server{
@@ -95,9 +90,8 @@ func main() {
 		blob:        newBlobClient(os.Getenv("BLOB_URL")),
 		contentHost: os.Getenv("CONTENT_HOST"),
 		tokenKey:    []byte(tokenKey),
-		tokenTTL:    tokenTTL,
 	}
-	go s.runJanitor(ctx, interval)
+	go s.runJanitor(ctx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/login", s.login)
@@ -105,11 +99,11 @@ func main() {
 	mux.HandleFunc("GET /api/me", s.auth(s.me))
 	mux.HandleFunc("GET /api/artifacts", s.auth(s.listArtifacts))
 	mux.HandleFunc("POST /api/artifacts", s.auth(s.createArtifact))
-	mux.HandleFunc("GET /api/artifacts/{id}", s.auth(s.getArtifact))
-	mux.HandleFunc("DELETE /api/artifacts/{id}", s.auth(s.deleteArtifact))
-	mux.HandleFunc("POST /api/artifacts/{id}/versions", s.auth(s.publishVersion))
-	mux.HandleFunc("GET /api/artifacts/{id}/versions/{number}/files", s.auth(s.readFiles))
-	mux.HandleFunc("POST /api/artifacts/{id}/expire-now", s.auth(s.expireNow))
+	mux.HandleFunc("GET /api/artifacts/{id}", s.authArtifact(s.getArtifact))
+	mux.HandleFunc("DELETE /api/artifacts/{id}", s.authArtifact(s.deleteArtifact))
+	mux.HandleFunc("POST /api/artifacts/{id}/versions", s.authArtifact(s.publishVersion))
+	mux.HandleFunc("GET /api/artifacts/{id}/versions/{number}/files", s.authArtifact(s.readFiles))
+	mux.HandleFunc("POST /api/artifacts/{id}/expire-now", s.authArtifact(s.expireNow))
 	// Outside /api/ on purpose: the front door only forwards /api/ from the outside.
 	mux.HandleFunc("GET /internal/authorize-content", s.authorizeContent)
 
@@ -133,6 +127,18 @@ func (s *server) auth(next handler) http.HandlerFunc {
 	}
 }
 
+// authArtifact also rejects a malformed ID, which would otherwise reach a uuid column and fail with a 500.
+func (s *server) authArtifact(next func(w http.ResponseWriter, r *http.Request, user, id string)) http.HandlerFunc {
+	return s.auth(func(w http.ResponseWriter, r *http.Request, user string) {
+		id := r.PathValue("id")
+		if !validID.MatchString(id) {
+			writeError(w, http.StatusNotFound, "artifact not found")
+			return
+		}
+		next(w, r, user, id)
+	})
+}
+
 func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name string `json:"name"`
@@ -149,15 +155,13 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err)
 		return
 	}
-	_, err := s.db.Exec(r.Context(),
-		`INSERT INTO users (id, container) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
-		req.Name, containerFor(req.Name))
+	_, err := s.db.Exec(r.Context(), `INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`, req.Name)
 	if err != nil {
 		internalError(w, err)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "user", Value: req.Name, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
-	writeJSON(w, http.StatusOK, map[string]string{"name": req.Name, "container": containerFor(req.Name)})
+	s.me(w, r, req.Name)
 }
 
 func (s *server) logout(w http.ResponseWriter, r *http.Request) {
@@ -173,42 +177,27 @@ func (s *server) me(w http.ResponseWriter, r *http.Request, user string) {
 
 func (s *server) listArtifacts(w http.ResponseWriter, r *http.Request, user string) {
 	rows, err := s.db.Query(r.Context(), `
-		SELECT id, title, live_version, retention_days, expires_at, updated_at
+		SELECT id, title, live_version
 		FROM artifacts WHERE owner_id = $1 AND deleted_at IS NULL
 		ORDER BY updated_at DESC`, user)
 	if err != nil {
 		internalError(w, err)
 		return
 	}
-	defer rows.Close()
-	result := []artifact{}
-	for rows.Next() {
-		var a artifact
-		if err := rows.Scan(&a.ID, &a.Title, &a.LiveVersion, &a.RetentionDays, &a.ExpiresAt, &a.UpdatedAt); err != nil {
-			internalError(w, err)
-			return
-		}
-		s.fill(&a, user)
-		result = append(result, a)
-	}
-	if err := rows.Err(); err != nil {
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[artifactSummary])
+	if err != nil {
 		internalError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
 }
 
-func (s *server) getArtifact(w http.ResponseWriter, r *http.Request, user string) {
-	id := r.PathValue("id")
-	if !validID.MatchString(id) {
-		writeError(w, http.StatusNotFound, "artifact not found")
-		return
-	}
+func (s *server) getArtifact(w http.ResponseWriter, r *http.Request, user, id string) {
 	var a artifact
 	err := s.db.QueryRow(r.Context(), `
-		SELECT id, title, live_version, retention_days, expires_at, updated_at
+		SELECT id, title, live_version, retention_days, expires_at
 		FROM artifacts WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL`, id, user).
-		Scan(&a.ID, &a.Title, &a.LiveVersion, &a.RetentionDays, &a.ExpiresAt, &a.UpdatedAt)
+		Scan(&a.ID, &a.Title, &a.LiveVersion, &a.RetentionDays, &a.ExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "artifact not found")
 		return
@@ -217,27 +206,21 @@ func (s *server) getArtifact(w http.ResponseWriter, r *http.Request, user string
 		internalError(w, err)
 		return
 	}
-	s.fill(&a, user)
+	a.BlobPrefix = "stlocal/" + containerFor(user) + "/" + a.ID + "/"
 
 	rows, err := s.db.Query(r.Context(), `
-		SELECT number, created_at FROM artifact_versions WHERE artifact_id = $1 ORDER BY number DESC`, id)
+		SELECT number FROM artifact_versions WHERE artifact_id = $1 ORDER BY number DESC`, id)
 	if err != nil {
 		internalError(w, err)
 		return
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var v version
-		if err := rows.Scan(&v.Number, &v.CreatedAt); err != nil {
-			internalError(w, err)
-			return
-		}
-		v.URL = s.contentURL(a.ID, user, v.Number)
-		a.Versions = append(a.Versions, v)
-	}
-	if err := rows.Err(); err != nil {
+	a.Versions, err = pgx.CollectRows(rows, pgx.RowToStructByNameLax[version])
+	if err != nil {
 		internalError(w, err)
 		return
+	}
+	for i := range a.Versions {
+		a.Versions[i].URL = s.contentURL(a.ID, user, a.Versions[i].Number)
 	}
 	writeJSON(w, http.StatusOK, a)
 }
@@ -294,17 +277,12 @@ func (s *server) createArtifact(w http.ResponseWriter, r *http.Request, user str
 		internalError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "version": 1, "url": s.contentURL(id, user, 1)})
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "version": 1})
 }
 
 // publishVersion is the core of the system: the client names the version its change is based on
 // (base_version). If a newer one went live in the meantime it gets a 409 instead of overwriting that work.
-func (s *server) publishVersion(w http.ResponseWriter, r *http.Request, user string) {
-	id := r.PathValue("id")
-	if !validID.MatchString(id) {
-		writeError(w, http.StatusNotFound, "artifact not found")
-		return
-	}
+func (s *server) publishVersion(w http.ResponseWriter, r *http.Request, user, id string) {
 	var req struct {
 		BaseVersion int    `json:"base_version"`
 		Files       []file `json:"files"`
@@ -340,10 +318,9 @@ func (s *server) publishVersion(w http.ResponseWriter, r *http.Request, user str
 		return
 	}
 	if req.BaseVersion != live {
-		writeJSON(w, http.StatusConflict, map[string]any{
-			"error":        fmt.Sprintf("version %d is live, your change is based on version %d", live, req.BaseVersion),
-			"live_version": live,
-		})
+		writeError(w, http.StatusConflict, fmt.Sprintf(
+			"Conflict: version %d is live now, your work is based on version %d. Reopen the artifact and redo your change there.",
+			live, req.BaseVersion))
 		return
 	}
 
@@ -365,7 +342,7 @@ func (s *server) publishVersion(w http.ResponseWriter, r *http.Request, user str
 		internalError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "version": next, "url": s.contentURL(id, user, next)})
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "version": next})
 }
 
 // storeVersion uploads the blobs, then records the version. It only goes live with the caller's commit.
@@ -386,12 +363,8 @@ func (s *server) storeVersion(ctx context.Context, tx pgx.Tx, user, id string, n
 	return err
 }
 
-func (s *server) readFiles(w http.ResponseWriter, r *http.Request, user string) {
-	id, number := r.PathValue("id"), r.PathValue("number")
-	if !validID.MatchString(id) {
-		writeError(w, http.StatusNotFound, "artifact not found")
-		return
-	}
+func (s *server) readFiles(w http.ResponseWriter, r *http.Request, user, id string) {
+	number := r.PathValue("number")
 	ctx := r.Context()
 	var n int
 	err := s.db.QueryRow(ctx, `
@@ -424,12 +397,7 @@ func (s *server) readFiles(w http.ResponseWriter, r *http.Request, user string) 
 	writeJSON(w, http.StatusOK, files)
 }
 
-func (s *server) deleteArtifact(w http.ResponseWriter, r *http.Request, user string) {
-	id := r.PathValue("id")
-	if !validID.MatchString(id) {
-		writeError(w, http.StatusNotFound, "artifact not found")
-		return
-	}
+func (s *server) deleteArtifact(w http.ResponseWriter, r *http.Request, user, id string) {
 	ctx := r.Context()
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -461,12 +429,7 @@ func (s *server) deleteArtifact(w http.ResponseWriter, r *http.Request, user str
 }
 
 // expireNow exists for the demo only, so nobody has to wait 30 days for the retention job.
-func (s *server) expireNow(w http.ResponseWriter, r *http.Request, user string) {
-	id := r.PathValue("id")
-	if !validID.MatchString(id) {
-		writeError(w, http.StatusNotFound, "artifact not found")
-		return
-	}
+func (s *server) expireNow(w http.ResponseWriter, r *http.Request, user, id string) {
 	tag, err := s.db.Exec(r.Context(), `
 		UPDATE artifacts SET expires_at = now()
 		WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL`, id, user)
@@ -484,13 +447,6 @@ func (s *server) expireNow(w http.ResponseWriter, r *http.Request, user string) 
 // authorizeContent is asked by the front door before every read, cache hits included. So a delete
 // takes effect immediately, at the price that reads now depend on the API and the database.
 func (s *server) authorizeContent(w http.ResponseWriter, r *http.Request) {
-	// Browsers set this header themselves and page scripts cannot change it. "document" means someone
-	// opened the link directly instead of through the iframe in our app. curl can still fake it,
-	// so this only keeps the view on our canvas, the token is what actually protects the content.
-	if r.Header.Get("X-Fetch-Dest") == "document" {
-		w.WriteHeader(http.StatusForbidden)
-		return
-	}
 	claims, ok := verifyToken(s.tokenKey, r.Header.Get("X-Content-Token"), time.Now())
 	if !ok || claims.Artifact != r.Header.Get("X-Artifact") || claims.Owner != r.Header.Get("X-Owner") ||
 		fmt.Sprintf("v%d", claims.Version) != r.Header.Get("X-Version") {
@@ -517,8 +473,8 @@ func (s *server) authorizeContent(w http.ResponseWriter, r *http.Request) {
 // --- Retention ---
 
 // runJanitor stands in for a storage account lifecycle policy.
-func (s *server) runJanitor(ctx context.Context, interval time.Duration) {
-	for range time.Tick(interval) {
+func (s *server) runJanitor(ctx context.Context) {
+	for range time.Tick(janitorInterval) {
 		if err := s.purgeExpired(ctx); err != nil {
 			log.Println("retention:", err)
 		}
@@ -534,26 +490,27 @@ func (s *server) purgeExpired(ctx context.Context) error {
 
 	// SKIP LOCKED skips artifacts a publish is working on right now.
 	rows, err := tx.Query(ctx, `
-		SELECT a.id, u.container FROM artifacts a JOIN users u ON u.id = a.owner_id
-		WHERE a.deleted_at IS NULL AND a.expires_at <= now()
-		ORDER BY a.expires_at LIMIT 100
-		FOR UPDATE OF a SKIP LOCKED`)
+		SELECT id, owner_id FROM artifacts
+		WHERE deleted_at IS NULL AND expires_at <= now()
+		ORDER BY expires_at LIMIT 100
+		FOR UPDATE SKIP LOCKED`)
 	if err != nil {
 		return err
 	}
-	type expired struct{ id, container string }
-	expiredRows, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (expired, error) {
-		var e expired
-		return e, row.Scan(&e.id, &e.container)
-	})
+	type expired struct {
+		ID      string
+		OwnerID string
+	}
+	expiredRows, err := pgx.CollectRows(rows, pgx.RowToStructByName[expired])
 	if err != nil {
 		return err
 	}
 	for _, e := range expiredRows {
-		if err := s.purge(ctx, tx, e.id, e.container, "retention expired"); err != nil {
+		container := containerFor(e.OwnerID)
+		if err := s.purge(ctx, tx, e.ID, container, "retention expired"); err != nil {
 			return err
 		}
-		log.Printf("retention: removed %s/%s", e.container, e.id)
+		log.Printf("retention: removed %s/%s", container, e.ID)
 	}
 	return tx.Commit(ctx)
 }
@@ -578,21 +535,16 @@ func versionPrefix(id string, number int) string {
 	return fmt.Sprintf("%s/v%d", id, number)
 }
 
-// contentURL builds the link the iframe loads. It carries a short-lived token, and every caller is an
-// endpoint scoped to the logged-in owner. The front door maps the hostname back to container and folder.
+// contentURL builds the link the iframe loads, with a short-lived token for the logged-in owner.
+// The front door maps the hostname back to container and folder.
 func (s *server) contentURL(id, user string, number int) string {
 	token := signToken(s.tokenKey, contentClaims{
 		Artifact: id,
 		Owner:    user,
 		Version:  number,
-		Expires:  time.Now().Add(s.tokenTTL).Unix(),
+		Expires:  time.Now().Add(contentTokenTTL).Unix(),
 	})
 	return fmt.Sprintf("http://%s--%s.%s/t/%s/v%d/index.html", id, user, s.contentHost, token, number)
-}
-
-func (s *server) fill(a *artifact, user string) {
-	a.BlobPrefix = "stlocal/" + containerFor(user) + "/" + a.ID + "/"
-	a.URL = s.contentURL(a.ID, user, a.LiveVersion)
 }
 
 func validateFiles(files []file) string {

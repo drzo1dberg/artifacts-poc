@@ -1,13 +1,7 @@
-import { blankFiles, sampleFiles } from "./sample.js";
-
-export interface ArtifactFile {
-  path: string;
-  content: string;
-}
+import { blankFiles, sampleFiles, type ArtifactFile } from "./sample.js";
 
 interface Version {
   number: number;
-  created_at: string;
   url: string;
 }
 
@@ -18,19 +12,19 @@ interface Artifact {
   retention_days: number;
   expires_at: string;
   blob_prefix: string;
-  url: string;
-  versions?: Version[];
+  versions: Version[];
+}
+
+type ArtifactSummary = Pick<Artifact, "id" | "title" | "live_version">;
+
+interface Published {
+  id: string;
+  version: number;
 }
 
 interface Me {
   name: string;
   container: string;
-}
-
-class ApiError extends Error {
-  constructor(public status: number, message: string, public liveVersion?: number) {
-    super(message);
-  }
 }
 
 async function api<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -44,7 +38,7 @@ async function api<T>(method: string, path: string, body?: unknown): Promise<T> 
   }
   const data = await res.json();
   if (!res.ok) {
-    throw new ApiError(res.status, data.error, data.live_version);
+    throw new Error(data.error);
   }
   return data as T;
 }
@@ -68,10 +62,9 @@ const ui = {
   list: el("list"),
   title: el<HTMLInputElement>("title"),
   retention: el<HTMLInputElement>("retention"),
-  retentionLabel: el("retention-label"),
   fileSelect: el<HTMLSelectElement>("file-select"),
   addFile: el("add-file"),
-  publish: el<HTMLButtonElement>("publish"),
+  publish: el("publish"),
   source: el<HTMLTextAreaElement>("source"),
   status: el("status"),
   versionSelect: el<HTMLSelectElement>("version-select"),
@@ -112,16 +105,20 @@ function renderFiles(): void {
   ui.source.value = files.find((f) => f.path === openFile)?.content ?? "";
 }
 
-function loadDraft(title: string, draft: ArtifactFile[]): void {
-  current = null;
-  baseVersion = 0;
-  files = draft.map((f) => ({ ...f }));
+function setEditor(artifact: Artifact | null, title: string, retentionDays: string, editorFiles: ArtifactFile[]): void {
+  current = artifact;
+  baseVersion = artifact?.live_version ?? 0;
+  files = editorFiles;
   openFile = "index.html";
   ui.title.value = title;
-  ui.title.readOnly = false;
-  ui.retention.disabled = false;
-  ui.retention.value = "30";
+  ui.title.readOnly = artifact !== null;
+  ui.retention.disabled = artifact !== null;
+  ui.retention.value = retentionDays;
   renderFiles();
+}
+
+function loadDraft(title: string, draft: ArtifactFile[]): void {
+  setEditor(null, title, ui.retention.defaultValue, draft.map((f) => ({ ...f })));
   renderPreview(null);
   setStatus("Draft: not published yet.");
   void refreshList();
@@ -151,17 +148,9 @@ function renderPreview(version: Version | null): void {
 async function openArtifact(id: string): Promise<void> {
   const artifact = await api<Artifact>("GET", "/artifacts/" + id);
   const loaded = await api<ArtifactFile[]>("GET", `/artifacts/${id}/versions/${artifact.live_version}/files`);
-  current = artifact;
-  baseVersion = artifact.live_version;
-  files = loaded;
-  openFile = "index.html";
-  ui.title.value = artifact.title;
-  ui.title.readOnly = true;
-  ui.retention.disabled = true;
-  ui.retention.value = String(artifact.retention_days);
-  renderFiles();
+  setEditor(artifact, artifact.title, String(artifact.retention_days), loaded);
 
-  const versions = artifact.versions ?? [];
+  const versions = artifact.versions;
   ui.versionSelect.replaceChildren(
     ...versions.map((v) => new Option(`Version ${v.number}${v.number === artifact.live_version ? " (live)" : ""}`, String(v.number))),
   );
@@ -171,7 +160,7 @@ async function openArtifact(id: string): Promise<void> {
 }
 
 async function refreshList(): Promise<void> {
-  const artifacts = await api<Artifact[]>("GET", "/artifacts");
+  const artifacts = await api<ArtifactSummary[]>("GET", "/artifacts");
   ui.list.replaceChildren(
     ...artifacts.map((a) => {
       const item = document.createElement("li");
@@ -196,31 +185,12 @@ async function refreshList(): Promise<void> {
 
 async function publish(): Promise<void> {
   saveEditor();
-  if (current) {
-    try {
-      const res = await api<{ id: string; version: number }>("POST", `/artifacts/${current.id}/versions`, {
-        base_version: baseVersion,
-        files,
-      });
-      await openArtifact(res.id);
-      setStatus(`Version ${res.version} is live.`);
-    } catch (err) {
-      // Deliberately no automatic retry with the new version number: that would overwrite the other change.
-      if (err instanceof ApiError && err.status === 409) {
-        setStatus(`Conflict: version ${err.liveVersion} is live now, your work is based on version ${baseVersion}. Reopen the artifact and redo your change there.`, true);
-        return;
-      }
-      throw err;
-    }
-    return;
-  }
-  const res = await api<{ id: string; version: number }>("POST", "/artifacts", {
-    title: ui.title.value,
-    retention_days: Number(ui.retention.value),
-    files,
-  });
+  // A conflict surfaces as an error on purpose. Retrying with the new version number would overwrite the other change.
+  const res = await (current
+    ? api<Published>("POST", `/artifacts/${current.id}/versions`, { base_version: baseVersion, files })
+    : api<Published>("POST", "/artifacts", { title: ui.title.value, retention_days: Number(ui.retention.value), files }));
   await openArtifact(res.id);
-  setStatus("Version 1 is live.");
+  setStatus(`Version ${res.version} is live.`);
 }
 
 async function showApp(me: Me): Promise<void> {
@@ -228,6 +198,11 @@ async function showApp(me: Me): Promise<void> {
   ui.app.hidden = false;
   ui.whoami.textContent = `${me.name} · container ${me.container}`;
   loadDraft("My artifact", blankFiles);
+  setInterval(() => {
+    if (!document.hidden) {
+      refreshList().catch(showError);
+    }
+  }, 5000);
 }
 
 // The bridge between artifact and app. The iframe has origin "null", so we check the source
@@ -282,7 +257,7 @@ ui.versionSelect.addEventListener("change", () => {
   api<Artifact>("GET", "/artifacts/" + current.id)
     .then((artifact) => {
       current = artifact;
-      renderPreview(artifact.versions?.find((v) => String(v.number) === number) ?? null);
+      renderPreview(artifact.versions.find((v) => String(v.number) === number) ?? null);
     })
     .catch(showError);
 });
@@ -300,12 +275,6 @@ ui.delete.addEventListener("click", () => {
     api("DELETE", `/artifacts/${current.id}`).then(refreshList).catch(showError);
   }
 });
-
-setInterval(() => {
-  if (!ui.app.hidden) {
-    refreshList().catch(showError);
-  }
-}, 5000);
 
 api<Me>("GET", "/me").then(showApp).catch(() => {
   ui.login.hidden = false;

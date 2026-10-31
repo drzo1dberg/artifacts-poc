@@ -50,7 +50,7 @@ An artifact is untrusted code that runs next to your logged-in session. Without 
 |---|---|---|---|
 | `frontdoor` | nginx | The only way in | `frontdoor/default.conf` |
 | `blobstore` | Go, standard library | Simulated storage account | `blobstore/main.go` |
-| `api` | Go, pgx | Control plane and retention job | `api/main.go`, `api/blob.go` |
+| `api` | Go, pgx | Control plane and retention job | `api/main.go`, `api/blob.go`, `api/token.go` |
 | `postgres` | PostgreSQL 17 | Metadata | `api/schema.sql` |
 | `web` | TypeScript, no framework | Editor and preview | `web/src/main.ts` |
 

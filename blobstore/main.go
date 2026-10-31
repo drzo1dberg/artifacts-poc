@@ -18,7 +18,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 )
 
 const root = "/data/stlocal"
@@ -76,12 +75,13 @@ func putBlob(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
-// writeAtomic writes to a temp file first so a half-written blob is never readable.
+// writeAtomic writes to a temp file first so a half-written blob is never readable. The file sits outside
+// every container, on the same volume, so listings cannot see it and the rename stays atomic.
 func writeAtomic(path string, body io.Reader) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".upload-*")
+	tmp, err := os.CreateTemp(root, ".upload-*")
 	if err != nil {
 		return err
 	}
@@ -137,12 +137,12 @@ func listBlobs(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
-		if !d.IsDir() && !strings.HasPrefix(d.Name(), ".upload-") {
+		if !d.IsDir() {
 			rel, err := filepath.Rel(filepath.Join(root, container), path)
 			if err != nil {
 				return err
 			}
-			names = append(names, filepath.ToSlash(rel))
+			names = append(names, rel)
 		}
 		return nil
 	})
@@ -158,7 +158,7 @@ func listBlobs(w http.ResponseWriter, r *http.Request) {
 func deletePrefix(w http.ResponseWriter, r *http.Request) {
 	prefix := r.URL.Query().Get("prefix")
 	dir, ok := resolve(r.PathValue("container"), prefix)
-	if !ok || prefix == "" || filepath.Clean(prefix) == "." {
+	if !ok || filepath.Clean(prefix) == "." {
 		http.Error(w, "a non-empty prefix is required", http.StatusBadRequest)
 		return
 	}
