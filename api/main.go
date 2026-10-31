@@ -40,6 +40,8 @@ type server struct {
 	db          *pgxpool.Pool
 	blob        *blobClient
 	contentHost string
+	tokenKey    []byte
+	tokenTTL    time.Duration
 }
 
 type file struct {
@@ -79,7 +81,22 @@ func main() {
 		log.Fatal("JANITOR_INTERVAL: ", err)
 	}
 
-	s := &server{db: db, blob: newBlobClient(os.Getenv("BLOB_URL")), contentHost: os.Getenv("CONTENT_HOST")}
+	tokenKey := os.Getenv("CONTENT_TOKEN_KEY")
+	if tokenKey == "" {
+		log.Fatal("CONTENT_TOKEN_KEY is required")
+	}
+	tokenTTL, err := time.ParseDuration(os.Getenv("CONTENT_TOKEN_TTL"))
+	if err != nil {
+		log.Fatal("CONTENT_TOKEN_TTL: ", err)
+	}
+
+	s := &server{
+		db:          db,
+		blob:        newBlobClient(os.Getenv("BLOB_URL")),
+		contentHost: os.Getenv("CONTENT_HOST"),
+		tokenKey:    []byte(tokenKey),
+		tokenTTL:    tokenTTL,
+	}
 	go s.runJanitor(ctx, interval)
 
 	mux := http.NewServeMux()
@@ -93,6 +110,8 @@ func main() {
 	mux.HandleFunc("POST /api/artifacts/{id}/versions", s.auth(s.publishVersion))
 	mux.HandleFunc("GET /api/artifacts/{id}/versions/{number}/files", s.auth(s.readFiles))
 	mux.HandleFunc("POST /api/artifacts/{id}/expire-now", s.auth(s.expireNow))
+	// Outside /api/ on purpose: the front door only forwards /api/ from the outside.
+	mux.HandleFunc("GET /internal/authorize-content", s.authorizeContent)
 
 	srv := &http.Server{Addr: ":8081", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	log.Println("api listening on :8081")
@@ -462,6 +481,39 @@ func (s *server) expireNow(w http.ResponseWriter, r *http.Request, user string) 
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// authorizeContent is asked by the front door before every read, cache hits included. So a delete
+// takes effect immediately, at the price that reads now depend on the API and the database.
+func (s *server) authorizeContent(w http.ResponseWriter, r *http.Request) {
+	// Browsers set this header themselves and page scripts cannot change it. "document" means someone
+	// opened the link directly instead of through the iframe in our app. curl can still fake it,
+	// so this only keeps the view on our canvas, the token is what actually protects the content.
+	if r.Header.Get("X-Fetch-Dest") == "document" {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	claims, ok := verifyToken(s.tokenKey, r.Header.Get("X-Content-Token"), time.Now())
+	if !ok || claims.Artifact != r.Header.Get("X-Artifact") || claims.Owner != r.Header.Get("X-Owner") ||
+		fmt.Sprintf("v%d", claims.Version) != r.Header.Get("X-Version") {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	var alive bool
+	err := s.db.QueryRow(r.Context(), `
+		SELECT EXISTS (
+			SELECT 1 FROM artifacts
+			WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL AND expires_at > now()
+		)`, claims.Artifact, claims.Owner).Scan(&alive)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if !alive {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // --- Retention ---
 
 // runJanitor stands in for a storage account lifecycle policy.
@@ -526,9 +578,16 @@ func versionPrefix(id string, number int) string {
 	return fmt.Sprintf("%s/v%d", id, number)
 }
 
-// contentURL builds the public URL. The front door maps the hostname back to container and folder.
+// contentURL builds the link the iframe loads. It carries a short-lived token, and every caller is an
+// endpoint scoped to the logged-in owner. The front door maps the hostname back to container and folder.
 func (s *server) contentURL(id, user string, number int) string {
-	return fmt.Sprintf("http://%s--%s.%s/v%d/index.html", id, user, s.contentHost, number)
+	token := signToken(s.tokenKey, contentClaims{
+		Artifact: id,
+		Owner:    user,
+		Version:  number,
+		Expires:  time.Now().Add(s.tokenTTL).Unix(),
+	})
+	return fmt.Sprintf("http://%s--%s.%s/t/%s/v%d/index.html", id, user, s.contentHost, token, number)
 }
 
 func (s *server) fill(a *artifact, user string) {

@@ -274,8 +274,17 @@ ui.addFile.addEventListener("click", () => {
 ui.publish.addEventListener("click", () => publish().catch(showError));
 
 ui.versionSelect.addEventListener("change", () => {
-  const version = current?.versions?.find((v) => String(v.number) === ui.versionSelect.value);
-  renderPreview(version ?? null);
+  if (!current) {
+    return;
+  }
+  // The link of a version expires, so ask for a fresh one instead of reusing the loaded list.
+  const number = ui.versionSelect.value;
+  api<Artifact>("GET", "/artifacts/" + current.id)
+    .then((artifact) => {
+      current = artifact;
+      renderPreview(artifact.versions?.find((v) => String(v.number) === number) ?? null);
+    })
+    .catch(showError);
 });
 
 ui.expire.addEventListener("click", () => {
