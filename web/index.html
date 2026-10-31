@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Artifacts POC</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="main.js"></script>
+</head>
+<body>
+  <form id="login" class="login" hidden>
+    <h1>Artifacts POC</h1>
+    <p>Fake login: a new name gets its own container.</p>
+    <input id="login-name" placeholder="alice" pattern="[a-z0-9]{1,20}" required autofocus>
+    <button>Log in</button>
+  </form>
+
+  <div id="app" class="app" hidden>
+    <header>
+      <strong>Artifacts POC</strong>
+      <span id="whoami" class="muted"></span>
+      <button id="logout" type="button">Log out</button>
+    </header>
+
+    <nav>
+      <button id="new-blank" type="button">New artifact</button>
+      <button id="new-sample" type="button">Load sandbox demo</button>
+      <ul id="list"></ul>
+    </nav>
+
+    <section class="editor">
+      <div class="row">
+        <input id="title" placeholder="Title">
+        <label id="retention-label">Retention
+          <input id="retention" type="number" min="1" max="3650" value="30"> days
+        </label>
+      </div>
+      <div class="row">
+        <select id="file-select" aria-label="File"></select>
+        <button id="add-file" type="button">Add file</button>
+        <button id="publish" type="button" class="primary">Publish</button>
+      </div>
+      <textarea id="source" spellcheck="false" aria-label="Source"></textarea>
+      <p id="status" role="status"></p>
+    </section>
+
+    <section class="preview">
+      <div class="row">
+        <select id="version-select" aria-label="Version"></select>
+        <button id="expire" type="button">Expire now</button>
+        <button id="delete" type="button">Delete</button>
+      </div>
+      <iframe id="frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="Artifact preview"></iframe>
+      <dl>
+        <dt>Blob folder</dt><dd id="blob-path">–</dd>
+        <dt>Front door URL</dt><dd id="content-url">–</dd>
+        <dt>Expires</dt><dd id="expires">–</dd>
+        <dt>postMessage</dt><dd id="bridge-log">–</dd>
+      </dl>
+    </section>
+  </div>
+</body>
+</html>

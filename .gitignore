@@ -1,0 +1,8 @@
+node_modules/
+dist/
+reports/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+tfplan

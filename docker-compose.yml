@@ -1,0 +1,53 @@
+services:
+  # Stands in for Azure Front Door: the only way in, routes by hostname, caches, sets the security headers.
+  frontdoor:
+    image: nginx:1.29-alpine
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./frontdoor/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api: { condition: service_started, restart: true }
+      web: { condition: service_started, restart: true }
+      blobstore: { condition: service_started, restart: true }
+
+  # TypeScript frontend as static files.
+  web:
+    build: ./web
+
+  # Control plane: users, metadata, versions, retention job.
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgres://artifacts:artifacts@postgres:5432/artifacts
+      BLOB_URL: http://blobstore:9000
+      CONTENT_HOST: usercontent.localhost:8080
+      JANITOR_INTERVAL: 10s
+    depends_on:
+      postgres: { condition: service_healthy }
+      blobstore: { condition: service_started }
+
+  # Stands in for a storage account: keeps blobs as files, reachable from outside only through the front door.
+  blobstore:
+    build: ./blobstore
+    volumes:
+      - blobdata:/data
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: artifacts
+      POSTGRES_PASSWORD: artifacts
+      POSTGRES_DB: artifacts
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -h forces TCP: the temporary init server only listens on the Unix socket and would report "ready" too early.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "artifacts"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  blobdata:
+  pgdata:
