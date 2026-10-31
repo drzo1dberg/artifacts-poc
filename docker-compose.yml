@@ -23,6 +23,9 @@ services:
       BLOB_URL: http://blobstore:9000
       CONTENT_HOST: usercontent.localhost:8080
       JANITOR_INTERVAL: 10s
+      # Local development value, signs the links the app hands out after login.
+      CONTENT_TOKEN_KEY: local-development-only
+      CONTENT_TOKEN_TTL: 15m
     depends_on:
       postgres: { condition: service_healthy }
       blobstore: { condition: service_started }

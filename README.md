@@ -88,15 +88,20 @@ There are two kinds of locking here and I had to think about why. `FOR UPDATE` p
 ### Reading
 
 ```
-GET <id>--alice.usercontent.localhost:8080/v2/index.html
+GET <id>--alice.usercontent.localhost:8080/t/<token>/v2/index.html
   -> the hostname regex validates the ID and the user
+  -> the API checks the token and that the artifact still exists
   -> edge cache: a HIT ends here
   -> blobstore: /u-alice/<id>/v2/index.html
 ```
 
-Reads need neither the API nor the database, so existing artifacts keep working when the API is down. Only Postgres knows which version is live. The app asks the API and puts that URL into the iframe.
+You only get a link after logging in. The login is just a username, no password. The API signs a token for the owner, valid for 15 minutes and for one version of one artifact, and puts it into the path. It has to be the path, because relative URLs inherit it, so `style.css` and `app.js` carry the token automatically.
 
-Because `v2` never changes, publishing needs no cache invalidation. The next version simply has a new URL.
+The link also refuses to open directly. Browsers send `Sec-Fetch-Dest: document` for a top-level visit and `iframe` inside our app, and scripts on the page cannot change that. So the content is only viewable on our canvas. curl can fake the header, so the token is what actually protects the content.
+
+The front door asks the API before every read, using nginx `auth_request`, and this runs before the cache. That makes a delete effective immediately. The price is that reads now depend on the API and the database, so artifacts stop loading when the API is down. Only Postgres knows which version is live. The app asks the API and puts that link into the iframe.
+
+Because `v2` never changes, publishing needs no cache invalidation. The next version simply has a new URL. The token stays out of the cache key, so new links still hit the cache.
 
 ### Isolation
 
@@ -117,7 +122,7 @@ The default is 30 days per artifact, and every publish restarts the clock. `purg
 
 - **Blobs first, database second.** After a crash in between, the job just runs again, because deleting is idempotent. The other order could leave data behind that nobody can find.
 - **`FOR UPDATE SKIP LOCKED`** skips artifacts that a publish is working on.
-- **Deleted is not instantly gone.** The edge keeps serving a cached file for up to 60 seconds. You have to plan for this with a real CDN too.
+- **Deleted means gone.** The API refuses the read even if the file is still in the edge cache, and the cached copy expires within 60 seconds.
 
 ## Try it
 
@@ -134,7 +139,9 @@ docker compose exec postgres psql -U artifacts -c \
   "select title, deleted_at, delete_reason from artifacts"  # the tombstone stays
 ```
 
-**Edge cache:** run `curl -I` twice on an artifact URL. You get `X-Cache-Status: MISS`, then `HIT`.
+**Login gate:** copy the front door URL shown in the app and open it in a new tab. You get a 403, because only the iframe in the app may show it. Remove the token from the URL and you get a 404.
+
+**Edge cache:** run `curl -I -H "Sec-Fetch-Dest: iframe"` twice on that URL. You get `X-Cache-Status: MISS`, then `HIT`.
 
 ## How this would look on Azure
 
@@ -190,7 +197,7 @@ Turning off Shared Key on the account means key-signed SAS tokens stop working. 
 
 The tradeoff is that managed identity origin auth does not work with Private Link. The storage account stays reachable over the internet and relies on Entra ID alone. That is why this would use Standard and not Premium.
 
-**Private artifacts are still unsolved.** In this POC, "private" only applies to the API, and anyone with the URL can read the content. Entra login does not change that, because Front Door reads with its own identity and not the user's. A SAS token would not help either, because it does not carry over to the relative `style.css` and `app.js`. Real access control means putting an authenticated proxy in front of storage, which gives up most of the edge cache.
+**Private artifacts need more than Front Door.** The POC gates reads with a signed link that the front door checks through the API. Entra login alone does not do that on Azure, because Front Door reads with its own identity and not the user's. A SAS token would not help either, because it does not carry over to the relative `style.css` and `app.js`.
 
 ## Where this differs from real Claude Artifacts
 
@@ -207,7 +214,9 @@ Everything behind that is my own model. How Anthropic stores, routes and retains
 
 ## Known shortcuts
 
-- The login cookie holds only the name and is not signed, so anyone can be anyone.
+- The login is only a username and the cookie is not signed, so anyone can be anyone.
+- A copied link stays valid for up to 15 minutes, even after logging out, for anyone who fakes the fetch header.
+- A page left open longer than 15 minutes cannot load further files until the artifact is reopened.
 - There is no HTTPS.
 - Every publish sends all files, and only text files work, because they travel as JSON strings.
 - A publish holds a database lock during the upload. It is correct but does not scale. A real version would upload under a random ID first and then move the pointer with `UPDATE ... WHERE live_version = base`.
