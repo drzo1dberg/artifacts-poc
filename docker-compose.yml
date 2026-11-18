@@ -93,7 +93,7 @@ services:
       retries: 30
 
   # One-shot: creates the model "agent-llm" with a 32k context. It uses a GGUF file from models/
-  # if there is one, otherwise it downloads qwen3.5:9b from the Ollama registry (6.6 GB).
+  # if there is one, otherwise it downloads qwen3.5:9b-q8_0 from the Ollama registry (10.5 GB).
   models:
     image: ollama/ollama:0.35.1
     environment:

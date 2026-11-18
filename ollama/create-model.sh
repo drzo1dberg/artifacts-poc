@@ -2,7 +2,7 @@
 # Creates the model "agent-llm" that llmgateway calls. Runs once per start in the "models" job.
 #
 # With a GGUF file in models/, for example from Hugging Face via setup.sh, it builds the model from
-# that file. Without one, it downloads qwen3.5:9b from the Ollama registry.
+# that file. Without one, it downloads qwen3.5:9b-q8_0 from the Ollama registry.
 set -eu
 
 gguf=$(find /models -maxdepth 1 -name '*.gguf' | sort | head -n 1)
@@ -22,9 +22,9 @@ PARAMETER top_p 0.95
 PARAMETER presence_penalty 1.5
 EOF
 else
-	echo "No GGUF file in models/, using qwen3.5:9b from the Ollama registry"
-	ollama show qwen3.5:9b >/dev/null 2>&1 || ollama pull qwen3.5:9b
-	echo 'FROM qwen3.5:9b' >/tmp/Modelfile
+	echo "No GGUF file in models/, using qwen3.5:9b-q8_0 from the Ollama registry"
+	ollama show qwen3.5:9b-q8_0 >/dev/null 2>&1 || ollama pull qwen3.5:9b-q8_0
+	echo 'FROM qwen3.5:9b-q8_0' >/tmp/Modelfile
 fi
 
 # Ollama's OpenAI compatible API cannot set the context size per request, so it goes into the model.

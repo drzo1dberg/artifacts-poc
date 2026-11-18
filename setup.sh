@@ -16,8 +16,8 @@ cd "$(dirname "$0")"
 # official weights from Qwen/Qwen3.5-9B with llama.cpp.
 HF_REPO="lmstudio-community/Qwen3.5-9B-GGUF"
 HF_REVISION="1379f25c6b505a3fc737bd7818cb09389cf807c1"
-HF_FILE="Qwen3.5-9B-Q4_K_M.gguf"
-HF_SHA256="cd76ec205963b3b33350093e6904d9de16c4e666fd104e1f632d25c7f15f2a13"
+HF_FILE="Qwen3.5-9B-Q8_0.gguf"
+HF_SHA256="096a84703a334662086e4b46b6a4dd896bad10a46f67cd84a53cfe1420b24717"
 
 APP_URL="http://app.localhost:8080"
 OVERRIDE="docker-compose.override.yml"
@@ -31,7 +31,7 @@ usage() {
 Usage: ./setup.sh [--model hf|ollama] [--gpu auto|vulkan|nvidia|cpu]
 
   --model hf       download $HF_FILE from huggingface.co/$HF_REPO (default)
-  --model ollama   let Ollama download qwen3.5:9b from its own registry
+  --model ollama   let Ollama download qwen3.5:9b-q8_0 from its own registry
   --gpu auto       NVIDIA if the container toolkit is set up, else Vulkan, else CPU (default)
   --gpu vulkan     AMD or Intel GPU through /dev/dri
   --gpu nvidia     NVIDIA GPU through the NVIDIA Container Toolkit
@@ -167,7 +167,7 @@ if [ "$model_source" = hf ]; then
 		info "$gguf_path is already there"
 	else
 		url="https://huggingface.co/$HF_REPO/resolve/$HF_REVISION/$HF_FILE"
-		info "Downloading $HF_FILE (5.6 GB) from huggingface.co/$HF_REPO"
+		info "Downloading $HF_FILE (9.5 GB) from huggingface.co/$HF_REPO"
 		# -C - resumes an interrupted download. The file gets its real name only after the check.
 		curl -fL -C - --retry 3 --progress-bar -o "$gguf_path.part" "$url"
 		info "Checking the SHA-256"
@@ -182,7 +182,7 @@ else
 		mv models/*.gguf models/unused/
 		info "Moved the GGUF files in models/ to models/unused/"
 	fi
-	info "Ollama downloads qwen3.5:9b (6.6 GB) from its registry when the stack starts"
+	info "Ollama downloads qwen3.5:9b-q8_0 (10.5 GB) from its registry when the stack starts"
 fi
 
 # --- Start ---
