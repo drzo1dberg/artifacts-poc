@@ -10,18 +10,37 @@ I wanted to understand the systems design, so I rebuilt the idea locally with Do
 
 ## Run it
 
+You need a Linux host with Docker Compose 2.24 or later and with virtualization turned on, so that `/dev/kvm` exists. `setup.sh` checks the host, downloads the model, and starts the stack:
+
 ```bash
 git clone https://github.com/drzo1dberg/artifacts-poc.git
 cd artifacts-poc
-docker compose up -d --build
+./setup.sh
 ```
 
-The host needs two devices:
+Then open <http://app.localhost:8080> and log in with any name. Chrome and Firefox resolve `*.localhost` on their own, Safari does not. The first run downloads several GB of Docker images and the 5.6 GB model and takes a few minutes. You can run `setup.sh` again at any time; it skips the steps that are done.
 
-- `/dev/kvm` for the Firecracker microVMs of `sandboxd`.
-- `/dev/dri` for the GPU that Ollama uses through Vulkan. I use an AMD Radeon RX 9060 XT with 16 GB VRAM.
+### The model
 
-The first start downloads the model `qwen3.5:9b`, which is 6.6 GB. Then open <http://app.localhost:8080>. Chrome and Firefox resolve `*.localhost` on their own, Safari does not. To remove everything including data, run `docker compose down -v`.
+By default, `setup.sh` downloads `Qwen3.5-9B-Q4_K_M.gguf` from [lmstudio-community/Qwen3.5-9B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.5-9B-GGUF) on Hugging Face. Qwen publishes no GGUF of this model itself; LM Studio converts the official weights from [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) with llama.cpp. The script pins the file to a commit and checks its SHA-256.
+
+The file goes into `models/`. The `models` job in `docker-compose.yml` runs `ollama/create-model.sh`, which builds the model `agent-llm` from the first GGUF file it finds there. A GGUF file holds the weights and a chat template, but Ollama returns tool calls and thinking as separate API fields only with its own renderer and parser, so the script sets `RENDERER qwen3.5` and `PARSER qwen3.5`.
+
+To get the model from the Ollama registry instead, run `./setup.sh --model ollama`. Without a GGUF file in `models/`, a plain `docker compose up -d --build` does the same.
+
+### The GPU
+
+`setup.sh` picks the GPU on its own. To choose yourself, pass `--gpu`:
+
+| Option | Hardware | How Ollama uses it |
+|---|---|---|
+| `vulkan` | AMD or Intel | Vulkan through `/dev/dri`, the default in `docker-compose.yml`. I use an AMD Radeon RX 9060 XT with 16 GB VRAM. |
+| `nvidia` | NVIDIA, with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) | CUDA. Untested, because I don't have an NVIDIA card. |
+| `cpu` | none | The CPU. A page then takes several minutes. |
+
+For `nvidia` and `cpu`, the script writes `docker-compose.override.yml`, which Docker Compose reads together with `docker-compose.yml`. With the 32k context, the model takes about 7 GB of VRAM.
+
+To stop the stack, run `docker compose down`. To also delete all data, including the model, run `docker compose down -v`.
 
 ## The one idea that explains the design
 

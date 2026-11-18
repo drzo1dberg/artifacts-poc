@@ -92,19 +92,16 @@ services:
       timeout: 5s
       retries: 30
 
-  # One-shot: downloads qwen3.5:9b on the first start (6.6 GB) and derives "agent-llm" with a
-  # 32k context. Ollama's OpenAI compatible API cannot set the context per request.
+  # One-shot: creates the model "agent-llm" with a 32k context. It uses a GGUF file from models/
+  # if there is one, otherwise it downloads qwen3.5:9b from the Ollama registry (6.6 GB).
   models:
     image: ollama/ollama:0.35.1
     environment:
       OLLAMA_HOST: ollama:11434
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -e
-        ollama show qwen3.5:9b >/dev/null 2>&1 || ollama pull qwen3.5:9b
-        printf 'FROM qwen3.5:9b\nPARAMETER num_ctx 32768\n' > /tmp/Modelfile
-        ollama create agent-llm -f /tmp/Modelfile
+    entrypoint: ["/bin/sh", "/create-model.sh"]
+    volumes:
+      - ./ollama/create-model.sh:/create-model.sh:ro
+      - ./models:/models:ro
     depends_on:
       ollama: { condition: service_healthy }
     restart: "no"

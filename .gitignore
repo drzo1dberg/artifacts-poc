@@ -1,3 +1,6 @@
 node_modules/
 dist/
 reports/
+models/*
+!models/README
+docker-compose.override.yml
