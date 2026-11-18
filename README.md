@@ -10,18 +10,39 @@ I wanted to understand the systems design, so I rebuilt the idea locally with Do
 
 ## Run it
 
+You need a Linux host with Docker Compose 2.24 or later and with virtualization turned on, so that `/dev/kvm` exists. `setup.sh` checks the host, downloads the model, and starts the stack:
+
 ```bash
 git clone https://github.com/drzo1dberg/artifacts-poc.git
 cd artifacts-poc
-docker compose up -d --build
+./setup.sh
 ```
 
-The host needs two devices:
+Then open <http://app.localhost:8080> and log in with any name. Chrome and Firefox resolve `*.localhost` on their own, Safari does not. The first run downloads several GB of Docker images and the 9.5 GB model and takes a few minutes. You can run `setup.sh` again at any time; it skips the steps that are done.
 
-- `/dev/kvm` for the Firecracker microVMs of `sandboxd`.
-- `/dev/dri` for the GPU that Ollama uses through Vulkan. I use an AMD Radeon RX 9060 XT with 16 GB VRAM.
+### The model
 
-The first start downloads the model `qwen3.5:9b`, which is 6.6 GB. Then open <http://app.localhost:8080>. Chrome and Firefox resolve `*.localhost` on their own, Safari does not. To remove everything including data, run `docker compose down -v`.
+By default, `setup.sh` downloads `Qwen3.5-9B-Q8_0.gguf` from [lmstudio-community/Qwen3.5-9B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.5-9B-GGUF) on Hugging Face. Qwen publishes no GGUF of this model itself; LM Studio converts the official weights from [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) with llama.cpp. The script pins the file to a commit and checks its SHA-256.
+
+The file goes into `models/`. The `models` job in `docker-compose.yml` runs `ollama/create-model.sh`, which builds the model `agent-llm` from the first GGUF file it finds there. A GGUF file holds the weights and a chat template, but Ollama returns tool calls and thinking as separate API fields only with its own renderer and parser, so the script sets `RENDERER qwen3.5` and `PARSER qwen3.5`.
+
+To get the model from the Ollama registry instead, run `./setup.sh --model ollama`. Without a GGUF file in `models/`, a plain `docker compose up -d --build` does the same.
+
+### The GPU
+
+`setup.sh` picks the GPU on its own. To choose yourself, pass `--gpu`:
+
+| Option | Hardware | How Ollama uses it |
+|---|---|---|
+| `vulkan` | AMD or Intel | Vulkan through `/dev/dri`, the default in `docker-compose.yml`. I use an AMD Radeon RX 9060 XT with 16 GB VRAM. |
+| `nvidia` | NVIDIA, with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) | CUDA. Untested, because I don't have an NVIDIA card. |
+| `cpu` | none | The CPU. A page then takes several minutes. |
+
+On the RX 9060 XT, Vulkan generated about 30 % more tokens per second than ROCm in my own comparison, and it needs no ROCm installation.
+
+For `nvidia` and `cpu`, the script writes `docker-compose.override.yml`, which Docker Compose reads together with `docker-compose.yml`. With the 32k context, the model takes about 10 GB of VRAM.
+
+To stop the stack, run `docker compose down`. To also delete all data, including the model, run `docker compose down -v`.
 
 ## The one idea that explains the design
 
@@ -54,7 +75,7 @@ An artifact is untrusted code that runs next to your logged-in session. Without 
          │ postgres │        │ llmgateway │    │ sandboxd  │  one Firecracker microVM per sandbox
          └──────────┘        └─────┬──────┘    └───────────┘
                                ┌───┴────┐
-                               │ ollama │  qwen3.5:9b on the GPU
+                               │ ollama │  Qwen3.5 9B on the GPU
                                └────────┘
 ```
 
@@ -177,16 +198,27 @@ Each session gets its own microVM. After 60 seconds without a tool call, `sandbo
 
 ### The model
 
-The model is `qwen3.5:9b`. Among the models that fit into 16 GB of VRAM, it is the strongest at agent tasks: [Artificial Analysis](https://artificialanalysis.ai/models/qwen3-5-9b) lists 87 % on τ²-Bench, against 36 % for `gemma4:12b`. Ollama runs it through Vulkan, which generated about 30 % more tokens per second than ROCm on this card in my own comparison.
+The model is Qwen3.5 9B, quantized to 8 bits (Q8_0). I chose it with a benchmark of the actual use case: the agent built each of four pages three times, through the api, the microVM, and the publish path. A script then loaded every published page in Chromium and used it, for example by clicking 7 × 6 = on the calculator and expecting 42.
+
+| Model, all from GGUF files | In memory | Tokens per second | Pages that work | Median time per page |
+|---|---|---|---|---|
+| Qwen3.5 9B Q4_K_M, 5.6 GB | 6.4 GB, all on the GPU | 41 | 9 of 12 | 41 s |
+| Qwen3.5 9B Q6_K, 7.4 GB | 7.9 GB, all on the GPU | 35 | 10 of 12 | 47 s |
+| **Qwen3.5 9B Q8_0, 9.5 GB** | 9.7 GB, all on the GPU | 30 | **12 of 12** | 59 s |
+| Qwen3.6 35B-A3B Q4_K_M, 20.5 GB | 21 GB, 30 % in system RAM | 27 | 11 of 12 | 88 s |
+
+Measured on an AMD Radeon RX 9060 XT (16 GB, Vulkan) with a Ryzen 7 3700X and DDR4. Tokens per second include reading the prompt. Twelve runs per model are a small sample, so read the differences as a trend, not as proof.
+
+What the numbers show:
+
+- **Speed follows file size.** To generate one token, the GPU reads every active weight once, so the memory bandwidth sets the limit. Q8_0 is 1.7 times the size of Q4_K_M and about 1.4 times slower.
+- **Fewer bits cause typos in code.** The failures of the smaller quantizations were real bugs: `newDate` instead of `new Date`, a calculator that showed `NaN`, and a table with 29 instead of 30 primes. A 9B model has few weights to absorb rounding errors, and one wrong token breaks a page.
+- **The MoE model is smarter but slower here.** Qwen3.6 35B-A3B has 35 billion weights, but only about 3 billion take part in each token. That keeps it usable even with 30 % of the model in system RAM. It was the only model that used `python3` for the primes task every time, as the prompt asked; the 9B models did so once in three runs. On this card it is still slower, and it needs a 20.5 GB download. For longer tasks with more steps, it is the better choice.
+- **A dense 27B model does not fit.** At 16.5 GB, part of it would run from system RAM for every token, at a fraction of the GPU's bandwidth.
 
 The api only knows an endpoint, a key, and the model name `agent`. LiteLLM maps that name to Ollama, so moving to Azure AI Foundry is a change in `llmgateway/config.yaml`, not in the code. The file has a commented example.
 
-| Measured on the RX 9060 XT | Time |
-|---|---|
-| One step with thinking, depending on how long the model thinks | 1 to 27 s |
-| The same first step with `AGENT_REASONING_EFFORT: none` | about 3 s instead of 11 s |
-| Writing a 5 to 15 KB `index.html` in one tool call | 30 to 85 s |
-| A whole page, from request to preview | 30 to 90 s |
+Thinking takes most of the time in short steps. With `AGENT_REASONING_EFFORT: none` in `docker-compose.yml`, a short first step took about 3 s instead of 11 s in a measurement with Q4_K_M. Writing a whole page in one tool call takes 30 to 80 s either way.
 
 A 9B model is a weak agent compared to a frontier model. Small pages work reliably. Long tasks with many steps go wrong more often. Sometimes the model describes the page it wrote and stops without calling `publish`. In that case `runAgent` reminds it once, and the model then publishes or explains why it doesn't.
 
