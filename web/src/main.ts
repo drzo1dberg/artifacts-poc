@@ -27,6 +27,28 @@ interface Me {
   container: string;
 }
 
+interface AgentSession {
+  id: string;
+  sandbox_id: string;
+}
+
+// One line of the NDJSON stream that POST /api/agent/sessions/{id}/messages returns.
+interface AgentEvent {
+  type: "status" | "reasoning" | "assistant" | "tool_call" | "tool_result" | "published" | "error" | "done";
+  text?: string;
+  name?: string;
+  arguments?: string;
+  is_error?: boolean;
+  artifact_id?: string;
+  version?: number;
+}
+
+interface EgressDecision {
+  method: string;
+  host: string;
+  action: string;
+}
+
 async function api<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch("/api" + path, {
     method,
@@ -75,6 +97,17 @@ const ui = {
   contentUrl: el("content-url"),
   expires: el("expires"),
   bridgeLog: el("bridge-log"),
+  tabCode: el("tab-code"),
+  tabAgent: el("tab-agent"),
+  codePane: el("code-pane"),
+  agentPane: el("agent-pane"),
+  agentSession: el("agent-session"),
+  agentEnd: el<HTMLButtonElement>("agent-end"),
+  agentLog: el("agent-log"),
+  agentForm: el<HTMLFormElement>("agent-form"),
+  agentInput: el<HTMLTextAreaElement>("agent-input"),
+  agentSend: el<HTMLButtonElement>("agent-send"),
+  egressLog: el("egress-log"),
 };
 
 // Editor state. current is null while a new artifact has not been published yet.
@@ -274,6 +307,203 @@ ui.delete.addEventListener("click", () => {
   if (current && confirm(`Delete "${current.title}" for good?`)) {
     api("DELETE", `/artifacts/${current.id}`).then(refreshList).catch(showError);
   }
+});
+
+// --- Agent ---
+// The api runs the agent loop and calls the model. Tool calls run in a microVM in sandboxd.
+// This page only sends messages and shows the steps as they arrive.
+
+let agentSession: AgentSession | null = null;
+
+function showTab(agent: boolean): void {
+  ui.codePane.hidden = agent;
+  ui.agentPane.hidden = !agent;
+  ui.tabCode.setAttribute("aria-selected", String(!agent));
+  ui.tabAgent.setAttribute("aria-selected", String(agent));
+  if (agent) {
+    ui.agentInput.focus();
+  }
+}
+
+function logLine(className: string, text: string): void {
+  const line = document.createElement("p");
+  line.className = "msg " + className;
+  line.textContent = text;
+  ui.agentLog.append(line);
+}
+
+function logBlock(text: string, isError = false): void {
+  const pre = document.createElement("pre");
+  pre.textContent = text;
+  pre.classList.toggle("error", isError);
+  ui.agentLog.append(pre);
+}
+
+function logDetails(summary: string, text: string): void {
+  const details = document.createElement("details");
+  const title = document.createElement("summary");
+  title.textContent = summary;
+  const pre = document.createElement("pre");
+  pre.textContent = text;
+  details.append(title, pre);
+  ui.agentLog.append(details);
+}
+
+// describeToolCall shows what matters about a call instead of raw JSON with a whole file in it.
+function describeToolCall(name: string, rawArgs: string): string {
+  try {
+    const args = JSON.parse(rawArgs) as Record<string, string>;
+    switch (name) {
+      case "run_command":
+        return "$ " + args.command;
+      case "write_file":
+        return `write_file ${args.path} (${new Blob([args.content ?? ""]).size} bytes)`;
+      case "read_file":
+        return "read_file " + args.path;
+      case "publish":
+        return "publish" + (args.title ? ` "${args.title}"` : "");
+    }
+  } catch {
+    // Fall through and show the raw arguments.
+  }
+  return `${name} ${rawArgs}`;
+}
+
+async function handleAgentEvent(event: AgentEvent): Promise<void> {
+  switch (event.type) {
+    case "status":
+      setStatus(event.text ?? "");
+      return;
+    case "reasoning":
+      logDetails("Thinking", event.text ?? "");
+      break;
+    case "assistant":
+      logLine("assistant", event.text ?? "");
+      break;
+    case "tool_call":
+      logLine("event", "▸ " + describeToolCall(event.name ?? "", event.arguments ?? ""));
+      break;
+    case "tool_result":
+      logBlock(event.text ?? "", event.is_error);
+      break;
+    case "published":
+      logLine("event", `✓ Published version ${event.version}`);
+      if (event.artifact_id) {
+        await openArtifact(event.artifact_id);
+      }
+      break;
+    case "error":
+      logLine("error", event.text ?? "Unknown error");
+      break;
+    case "done":
+      return;
+  }
+  ui.agentLog.scrollTop = ui.agentLog.scrollHeight;
+}
+
+async function startAgentSession(): Promise<AgentSession> {
+  setStatus("Starting a microVM for this session...");
+  const session = await api<AgentSession>("POST", "/agent/sessions");
+  agentSession = session;
+  ui.agentSession.textContent = `Session ${session.id.slice(0, 8)} · sandbox ${session.sandbox_id}`;
+  ui.agentEnd.disabled = false;
+  return session;
+}
+
+async function postAgentMessage(session: AgentSession, content: string): Promise<Response> {
+  return fetch(`/api/agent/sessions/${session.id}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+}
+
+async function sendAgentMessage(content: string): Promise<void> {
+  let session = agentSession ?? (await startAgentSession());
+  logLine("user", content);
+  let res = await postAgentMessage(session, content);
+  if (res.status === 404) {
+    // The api forgot the session, for example after a restart. Start over with a new microVM.
+    logLine("event", "The session expired. Starting a new one, files from the old microVM are gone.");
+    session = await startAgentSession();
+    res = await postAgentMessage(session, content);
+  }
+  if (!res.ok || !res.body) {
+    const data = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(data.error);
+  }
+
+  // Each line is one JSON event. A chunk can end in the middle of a line, so keep the rest.
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += value;
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (line.trim()) {
+        await handleAgentEvent(JSON.parse(line) as AgentEvent);
+      }
+    }
+  }
+  setStatus("The agent is done.");
+  await showEgress(session);
+}
+
+async function showEgress(session: AgentSession): Promise<void> {
+  const decisions = await api<EgressDecision[]>("GET", `/agent/sessions/${session.id}/egress`);
+  ui.egressLog.textContent = decisions.length
+    ? decisions.slice(-3).map((d) => `${d.action} ${d.method} ${d.host}`).join(", ")
+    : "no outbound connections";
+}
+
+ui.tabCode.addEventListener("click", () => showTab(false));
+ui.tabAgent.addEventListener("click", () => showTab(true));
+
+ui.agentForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const content = ui.agentInput.value.trim();
+  if (!content) {
+    return;
+  }
+  ui.agentInput.value = "";
+  ui.agentSend.disabled = true;
+  sendAgentMessage(content)
+    .catch((err) => {
+      logLine("error", err instanceof Error ? err.message : String(err));
+      showError(err);
+    })
+    .finally(() => {
+      ui.agentSend.disabled = false;
+    });
+});
+
+// Enter sends, Shift+Enter starts a new line.
+ui.agentInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    ui.agentForm.requestSubmit();
+  }
+});
+
+ui.agentEnd.addEventListener("click", () => {
+  if (!agentSession) {
+    return;
+  }
+  api("DELETE", `/agent/sessions/${agentSession.id}`)
+    .then(() => {
+      agentSession = null;
+      ui.agentLog.replaceChildren();
+      ui.agentEnd.disabled = true;
+      ui.agentSession.textContent = "No session. Your first message starts a microVM.";
+      ui.egressLog.textContent = "–";
+      setStatus("Session ended, the microVM is deleted.");
+    })
+    .catch(showError);
 });
 
 api<Me>("GET", "/me").then(showApp).catch(() => {

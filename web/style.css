@@ -101,6 +101,43 @@ nav li button.active { border-color: var(--mauve); }
 }
 .editor { border-right: 1px solid var(--surface0); }
 
+.tabs { display: flex; gap: 4px; }
+.tabs button[aria-selected="true"] { border-color: var(--mauve); color: var(--mauve); }
+.pane { display: flex; flex: 1; flex-direction: column; gap: 8px; min-height: 0; }
+
+.agent-log {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  padding: 8px;
+  overflow-y: auto;
+  background: var(--mantle);
+  border: 1px solid var(--surface0);
+  border-radius: 4px;
+}
+.agent-log > * { margin: 0; }
+.msg { padding: 6px 8px; border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.user { align-self: flex-end; max-width: 85%; background: var(--surface0); }
+.msg.event { color: var(--mauve); font-family: var(--mono); font-size: 12px; }
+.msg.error { color: var(--red); }
+.agent-log details, .agent-log pre { font-family: var(--mono); font-size: 12px; }
+.agent-log summary { cursor: pointer; color: var(--subtext); }
+.agent-log pre {
+  max-height: 180px;
+  margin: 0;
+  padding: 6px 8px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-left: 2px solid var(--surface1);
+}
+.agent-log pre.error { border-left-color: var(--red); }
+.agent-form { display: flex; gap: 8px; align-items: flex-end; }
+.agent-form textarea { flex: 1; white-space: pre-wrap; }
+.agent-form button { margin-left: 0; }
+
 .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 #title { flex: 1; min-width: 120px; }
 #retention { width: 70px; }

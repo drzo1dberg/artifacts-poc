@@ -1,0 +1,20 @@
+# LiteLLM stands in for Azure AI Foundry: one OpenAI compatible endpoint with a key, and the
+# model behind it is configuration. The api only knows the name "agent".
+model_list:
+  - model_name: agent
+    litellm_params:
+      model: ollama_chat/agent-llm
+      api_base: http://ollama:11434
+    model_info:
+      supports_function_calling: true
+
+  # On Azure, swap the entry above for a Foundry deployment. The api stays unchanged, for example:
+  #
+  # - model_name: agent
+  #   litellm_params:
+  #     model: azure_ai/claude-sonnet-4-5
+  #     api_base: https://RESOURCE.services.ai.azure.com/anthropic
+  #     api_key: os.environ/AZURE_AI_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

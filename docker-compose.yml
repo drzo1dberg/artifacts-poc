@@ -24,9 +24,19 @@ services:
       CONTENT_HOST: usercontent.localhost:8080
       # Local development value, signs the links the app hands out after login.
       CONTENT_TOKEN_KEY: local-development-only
+      # The agent loop: the model gateway it calls and the sandboxes its tool calls run in.
+      LLM_URL: http://llmgateway:4000
+      LLM_API_KEY: local-development-only
+      LLM_MODEL: agent
+      # Empty means the model decides. "none" turns thinking off: about 3 instead of 11 seconds per step.
+      AGENT_REASONING_EFFORT: ""
+      SANDBOXD_URL: http://sandboxd:8090
+      SANDBOXD_TOKEN: local-development-only
     depends_on:
       postgres: { condition: service_healthy }
       blobstore: { condition: service_started }
+      sandboxd: { condition: service_started }
+      llmgateway: { condition: service_started }
 
   # Stands in for a storage account: keeps blobs as files, reachable from outside only through the front door.
   blobstore:
@@ -52,6 +62,53 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # Stands in for Azure AI Foundry: the model gateway the api calls. The api only knows this
+  # endpoint, a key, and the model name "agent".
+  llmgateway:
+    image: ghcr.io/berriai/litellm:v1.102.1
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      # Local development value, the api sends it as its API key.
+      LITELLM_MASTER_KEY: local-development-only
+    volumes:
+      - ./llmgateway/config.yaml:/app/config.yaml:ro
+    depends_on:
+      models: { condition: service_completed_successfully }
+
+  # Runs the model on the GPU. Vulkan works on AMD and Intel without ROCm and only needs /dev/dri.
+  ollama:
+    image: ollama/ollama:0.35.1
+    devices:
+      - /dev/dri
+    environment:
+      # Local models only, no Ollama cloud models.
+      OLLAMA_NO_CLOUD: "1"
+      OLLAMA_KEEP_ALIVE: 10m
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # One-shot: downloads qwen3.5:9b on the first start (6.6 GB) and derives "agent-llm" with a
+  # 32k context. Ollama's OpenAI compatible API cannot set the context per request.
+  models:
+    image: ollama/ollama:0.35.1
+    environment:
+      OLLAMA_HOST: ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        ollama show qwen3.5:9b >/dev/null 2>&1 || ollama pull qwen3.5:9b
+        printf 'FROM qwen3.5:9b\nPARAMETER num_ctx 32768\n' > /tmp/Modelfile
+        ollama create agent-llm -f /tmp/Modelfile
+    depends_on:
+      ollama: { condition: service_healthy }
+    restart: "no"
+
   postgres:
     image: postgres:17-alpine
     environment:
@@ -68,6 +125,7 @@ services:
       retries: 30
 
 volumes:
+  ollama-models:
   sandboxdata:
   blobdata:
   pgdata:

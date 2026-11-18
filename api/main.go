@@ -43,6 +43,7 @@ type server struct {
 	blob        *blobClient
 	contentHost string
 	tokenKey    []byte
+	agents      *agents
 }
 
 type file struct {
@@ -90,6 +91,12 @@ func main() {
 		blob:        newBlobClient(os.Getenv("BLOB_URL")),
 		contentHost: os.Getenv("CONTENT_HOST"),
 		tokenKey:    []byte(tokenKey),
+		agents: newAgents(agentConfig{
+			llmURL:          os.Getenv("LLM_URL"),
+			llmKey:          os.Getenv("LLM_API_KEY"),
+			llmModel:        os.Getenv("LLM_MODEL"),
+			reasoningEffort: os.Getenv("AGENT_REASONING_EFFORT"),
+		}, newSandboxClient(os.Getenv("SANDBOXD_URL"), os.Getenv("SANDBOXD_TOKEN"))),
 	}
 	go s.runJanitor(ctx)
 
@@ -104,6 +111,10 @@ func main() {
 	mux.HandleFunc("POST /api/artifacts/{id}/versions", s.authArtifact(s.publishVersion))
 	mux.HandleFunc("GET /api/artifacts/{id}/versions/{number}/files", s.authArtifact(s.readFiles))
 	mux.HandleFunc("POST /api/artifacts/{id}/expire-now", s.authArtifact(s.expireNow))
+	mux.HandleFunc("POST /api/agent/sessions", s.auth(s.createAgentSession))
+	mux.HandleFunc("DELETE /api/agent/sessions/{id}", s.agentSession(s.deleteAgentSession))
+	mux.HandleFunc("POST /api/agent/sessions/{id}/messages", s.agentSession(s.sendAgentMessage))
+	mux.HandleFunc("GET /api/agent/sessions/{id}/egress", s.agentSession(s.agentEgress))
 	// Outside /api/ on purpose: the front door only forwards /api/ from the outside.
 	mux.HandleFunc("GET /internal/authorize-content", s.authorizeContent)
 
@@ -252,11 +263,19 @@ func (s *server) createArtifact(w http.ResponseWriter, r *http.Request, user str
 		return
 	}
 
-	ctx := r.Context()
-	tx, err := s.db.Begin(ctx)
+	id, err := s.insertArtifact(r.Context(), user, req.Title, retention, req.Files)
 	if err != nil {
 		internalError(w, err)
 		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "version": 1})
+}
+
+// insertArtifact creates an artifact with its first version. The caller has validated the input.
+func (s *server) insertArtifact(ctx context.Context, user, title string, retention int, files []file) (string, error) {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return "", err
 	}
 	defer tx.Rollback(ctx)
 
@@ -264,20 +283,14 @@ func (s *server) createArtifact(w http.ResponseWriter, r *http.Request, user str
 	err = tx.QueryRow(ctx, `
 		INSERT INTO artifacts (owner_id, title, live_version, retention_days, expires_at)
 		VALUES ($1, $2, 1, $3, now() + make_interval(days => $3))
-		RETURNING id`, user, req.Title, retention).Scan(&id)
+		RETURNING id`, user, title, retention).Scan(&id)
 	if err != nil {
-		internalError(w, err)
-		return
+		return "", err
 	}
-	if err := s.storeVersion(ctx, tx, user, id, 1, req.Files); err != nil {
-		internalError(w, err)
-		return
+	if err := s.storeVersion(ctx, tx, user, id, 1, files); err != nil {
+		return "", err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		internalError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "version": 1})
+	return id, tx.Commit(ctx)
 }
 
 // publishVersion is the core of the system: the client names the version its change is based on
@@ -294,12 +307,33 @@ func (s *server) publishVersion(w http.ResponseWriter, r *http.Request, user, id
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
+	next, err := s.publishFiles(r.Context(), user, id, req.BaseVersion, req.Files)
+	var conflict *conflictError
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		writeError(w, http.StatusNotFound, "artifact not found")
+	case errors.As(err, &conflict):
+		writeError(w, http.StatusConflict, conflict.Error())
+	case err != nil:
+		internalError(w, err)
+	default:
+		writeJSON(w, http.StatusCreated, map[string]any{"id": id, "version": next})
+	}
+}
 
-	ctx := r.Context()
+type conflictError struct{ live, base int }
+
+func (e *conflictError) Error() string {
+	return fmt.Sprintf("Conflict: version %d is live now, your work is based on version %d. Reopen the artifact and redo your change there.",
+		e.live, e.base)
+}
+
+// publishFiles stores the files as the version after base. It returns pgx.ErrNoRows when the
+// artifact is gone and a *conflictError when base is no longer the live version.
+func (s *server) publishFiles(ctx context.Context, user, id string, base int, files []file) (int, error) {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
-		internalError(w, err)
-		return
+		return 0, err
 	}
 	defer tx.Rollback(ctx)
 
@@ -309,25 +343,16 @@ func (s *server) publishVersion(w http.ResponseWriter, r *http.Request, user, id
 		SELECT live_version FROM artifacts
 		WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL AND expires_at > now()
 		FOR UPDATE`, id, user).Scan(&live)
-	if errors.Is(err, pgx.ErrNoRows) {
-		writeError(w, http.StatusNotFound, "artifact not found")
-		return
-	}
 	if err != nil {
-		internalError(w, err)
-		return
+		return 0, err
 	}
-	if req.BaseVersion != live {
-		writeError(w, http.StatusConflict, fmt.Sprintf(
-			"Conflict: version %d is live now, your work is based on version %d. Reopen the artifact and redo your change there.",
-			live, req.BaseVersion))
-		return
+	if base != live {
+		return 0, &conflictError{live: live, base: base}
 	}
 
 	next := live + 1
-	if err := s.storeVersion(ctx, tx, user, id, next, req.Files); err != nil {
-		internalError(w, err)
-		return
+	if err := s.storeVersion(ctx, tx, user, id, next, files); err != nil {
+		return 0, err
 	}
 	// Every publish restarts retention: the clock counts from the last change.
 	_, err = tx.Exec(ctx, `
@@ -335,14 +360,9 @@ func (s *server) publishVersion(w http.ResponseWriter, r *http.Request, user, id
 		SET live_version = $2, updated_at = now(), expires_at = now() + make_interval(days => retention_days)
 		WHERE id = $1`, id, next)
 	if err != nil {
-		internalError(w, err)
-		return
+		return 0, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		internalError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "version": next})
+	return next, tx.Commit(ctx)
 }
 
 // storeVersion uploads the blobs, then records the version. It only goes live with the caller's commit.
@@ -478,6 +498,7 @@ func (s *server) runJanitor(ctx context.Context) {
 		if err := s.purgeExpired(ctx); err != nil {
 			log.Println("retention:", err)
 		}
+		s.agents.expireIdle(ctx)
 	}
 }
 
