@@ -34,7 +34,7 @@ interface AgentSession {
 
 // One line of the NDJSON stream that POST /api/agent/sessions/{id}/messages returns.
 interface AgentEvent {
-  type: "status" | "reasoning" | "assistant" | "tool_call" | "tool_result" | "published" | "error" | "done";
+  type: "status" | "progress" | "reasoning" | "assistant" | "tool_call" | "tool_result" | "published" | "error" | "done";
   text?: string;
   name?: string;
   arguments?: string;
@@ -369,11 +369,26 @@ function describeToolCall(name: string, rawArgs: string): string {
   return `${name} ${rawArgs}`;
 }
 
+// progressLine is the one log line that shows how a model step is going. It is updated in place
+// and removed once the step produces something to show.
+let progressLine: HTMLElement | undefined;
+
 async function handleAgentEvent(event: AgentEvent): Promise<void> {
+  if (event.type !== "progress" && event.type !== "status") {
+    progressLine?.remove();
+    progressLine = undefined;
+  }
   switch (event.type) {
     case "status":
       setStatus(event.text ?? "");
       return;
+    case "progress":
+      if (!progressLine) {
+        logLine("progress", "");
+        progressLine = ui.agentLog.lastElementChild as HTMLElement;
+      }
+      progressLine.textContent = event.text ?? "";
+      break;
     case "reasoning":
       logDetails("Thinking", event.text ?? "");
       break;

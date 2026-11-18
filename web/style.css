@@ -122,6 +122,7 @@ nav li button.active { border-color: var(--mauve); }
 .msg.user { align-self: flex-end; max-width: 85%; background: var(--surface0); }
 .msg.event { color: var(--mauve); font-family: var(--mono); font-size: 12px; }
 .msg.error { color: var(--red); }
+.msg.progress { color: var(--subtext); font-family: var(--mono); font-size: 12px; }
 .agent-log details, .agent-log pre { font-family: var(--mono); font-size: 12px; }
 .agent-log summary { cursor: pointer; color: var(--subtext); }
 .agent-log pre {

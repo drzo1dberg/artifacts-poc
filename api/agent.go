@@ -10,6 +10,7 @@ package main
 //              sandboxd ──► microVM for this session
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -103,18 +104,13 @@ type chatMessage struct {
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
-type chatResponse struct {
-	Choices []struct {
-		Message struct {
-			Content          string     `json:"content"`
-			ReasoningContent string     `json:"reasoning_content"`
-			ToolCalls        []toolCall `json:"tool_calls"`
-		} `json:"message"`
-	} `json:"choices"`
-	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-	} `json:"usage"`
+// modelReply is one assembled answer of the model, with its token counts.
+type modelReply struct {
+	Content          string
+	ReasoningContent string
+	ToolCalls        []toolCall
+	PromptTokens     int
+	CompletionTokens int
 }
 
 func tool(name, description string, properties map[string]any, required ...string) map[string]any {
@@ -135,8 +131,35 @@ var agentTools = []map[string]any{
 		map[string]any{"title": map[string]any{"type": "string", "description": "Short title, used only for the first publish"}}),
 }
 
-func (a *agents) complete(ctx context.Context, messages []chatMessage) (*chatResponse, error) {
-	body := map[string]any{"model": a.cfg.llmModel, "messages": messages, "tools": agentTools}
+// streamChunk is one server-sent event of a streamed chat completion.
+type streamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+			ToolCalls        []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+	} `json:"choices"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
+}
+
+// complete asks the model for the next step. It streams the answer so that a long step can report
+// progress through onProgress, about once a second, and returns the assembled message.
+func (a *agents) complete(ctx context.Context, messages []chatMessage, onProgress func(string)) (*modelReply, error) {
+	body := map[string]any{
+		"model": a.cfg.llmModel, "messages": messages, "tools": agentTools,
+		"stream": true, "stream_options": map[string]bool{"include_usage": true},
+	}
 	if a.cfg.reasoningEffort != "" {
 		body["reasoning_effort"] = a.cfg.reasoningEffort
 	}
@@ -147,21 +170,132 @@ func (a *agents) complete(ctx context.Context, messages []chatMessage) (*chatRes
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+a.cfg.llmKey)
-	res, err := a.http.Do(req)
-	if err != nil {
-		return nil, err
+	var (
+		content, reasoning strings.Builder
+		calls              []toolCall
+		chunks             int
+		out                modelReply
+	)
+	start, lastReport, lastChunk := time.Now(), time.Now(), time.Now()
+	report := func() {
+		phase := "waiting for the first token"
+		switch {
+		case len(calls) > 0:
+			phase = "writing a tool call"
+		case chunks > 0 && time.Since(lastChunk) > 2*time.Second:
+			// Silence after the first tokens: most likely a tool call that is sent only once
+			// it is complete.
+			phase = "writing"
+		case content.Len() > 0:
+			phase = "writing the answer"
+		case reasoning.Len() > 0:
+			phase = "thinking"
+		}
+		text := fmt.Sprintf("model is %s · %d s", phase, int(time.Since(start).Seconds()))
+		if phase == "thinking" || phase == "writing the answer" {
+			text += fmt.Sprintf(" · %d tokens", chunks)
+		}
+		onProgress(text)
 	}
-	defer res.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
-	if err != nil {
-		return nil, err
+
+	// Some servers, Ollama among them, send a tool call in one piece once it is complete. Then
+	// no chunk arrives while the model writes it, and only this ticker shows that time passes.
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	// The request runs in its own goroutine, because a gateway can hold back even the response
+	// headers until the first token, and that can be the whole tool call.
+	lines := make(chan string)
+	readErr := make(chan error, 1)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		defer close(lines)
+		res, err := a.http.Do(req)
+		if err != nil {
+			readErr <- err
+			return
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+			readErr <- fmt.Errorf("%s %s", res.Status, truncate(string(raw), 300))
+			return
+		}
+		scanner := bufio.NewScanner(io.LimitReader(res.Body, 16<<20))
+		scanner.Buffer(make([]byte, 64<<10), 4<<20)
+		for scanner.Scan() {
+			select {
+			case lines <- scanner.Text():
+			case <-stop:
+				return
+			}
+		}
+		readErr <- scanner.Err()
+	}()
+
+	for done := false; !done; {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+			report()
+			lastReport = time.Now()
+		case line, ok := <-lines:
+			if !ok {
+				done = true
+				break
+			}
+			payload, found := strings.CutPrefix(line, "data:")
+			payload = strings.TrimSpace(payload)
+			if !found || payload == "" || payload == "[DONE]" {
+				continue
+			}
+			var chunk streamChunk
+			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+				return nil, fmt.Errorf("LLM gateway: unexpected chunk %s", truncate(payload, 300))
+			}
+			if chunk.Usage != nil {
+				out.PromptTokens = chunk.Usage.PromptTokens
+				out.CompletionTokens = chunk.Usage.CompletionTokens
+			}
+			if len(chunk.Choices) == 0 {
+				continue
+			}
+			delta := chunk.Choices[0].Delta
+			if delta.Content != "" || delta.ReasoningContent != "" || len(delta.ToolCalls) > 0 {
+				chunks++
+				lastChunk = time.Now()
+			}
+			content.WriteString(delta.Content)
+			reasoning.WriteString(delta.ReasoningContent)
+			// Tool calls arrive in parts keyed by index: the first part has the ID and the name,
+			// later parts add to the arguments.
+			for _, part := range delta.ToolCalls {
+				for len(calls) <= part.Index {
+					calls = append(calls, toolCall{})
+				}
+				c := &calls[part.Index]
+				if part.ID != "" {
+					c.ID = part.ID
+				}
+				c.Function.Name += part.Function.Name
+				c.Function.Arguments += part.Function.Arguments
+			}
+			if time.Since(lastReport) >= time.Second {
+				report()
+				lastReport = time.Now()
+			}
+		}
 	}
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("LLM gateway: %s %s", res.Status, truncate(string(raw), 300))
+	if err := <-readErr; err != nil {
+		return nil, fmt.Errorf("LLM gateway: %w", err)
 	}
-	var out chatResponse
-	if err := json.Unmarshal(raw, &out); err != nil || len(out.Choices) == 0 {
-		return nil, fmt.Errorf("LLM gateway: unexpected answer %s", truncate(string(raw), 300))
+
+	out.Content, out.ReasoningContent = content.String(), reasoning.String()
+	for _, c := range calls {
+		if c.Function.Name != "" {
+			out.ToolCalls = append(out.ToolCalls, c)
+		}
 	}
 	return &out, nil
 }
@@ -282,6 +416,9 @@ func (s *server) runAgent(ctx context.Context, sess *agentSession, content strin
 	sess.lastUsed = time.Now()
 	sess.mu.Unlock()
 
+	// unpublished is set by write_file and cleared by publish. Small models sometimes describe the
+	// page they built and stop without publishing it, so they get one reminder per message.
+	unpublished, reminded := false, false
 	for step := 1; step <= agentMaxSteps; step++ {
 		sess.mu.Lock()
 		history := append([]chatMessage(nil), sess.messages...)
@@ -289,13 +426,14 @@ func (s *server) runAgent(ctx context.Context, sess *agentSession, content strin
 
 		emit(agentEvent{Type: "status", Text: fmt.Sprintf("Step %d: waiting for the model", step)})
 		start := time.Now()
-		res, err := a.complete(ctx, history)
+		msg, err := a.complete(ctx, history, func(text string) {
+			emit(agentEvent{Type: "progress", Text: fmt.Sprintf("Step %d: %s", step, text)})
+		})
 		if err != nil {
 			return err
 		}
-		msg := res.Choices[0].Message
 		log.Printf("agent: session %s step %d: %d+%d tokens in %s, %d tool calls", sess.ID, step,
-			res.Usage.PromptTokens, res.Usage.CompletionTokens, time.Since(start).Round(time.Millisecond), len(msg.ToolCalls))
+			msg.PromptTokens, msg.CompletionTokens, time.Since(start).Round(time.Millisecond), len(msg.ToolCalls))
 		if r := strings.TrimSpace(msg.ReasoningContent); r != "" {
 			emit(agentEvent{Type: "reasoning", Text: r})
 		}
@@ -312,12 +450,29 @@ func (s *server) runAgent(ctx context.Context, sess *agentSession, content strin
 			emit(agentEvent{Type: "assistant", Text: text})
 		}
 		if len(msg.ToolCalls) == 0 {
-			return nil
+			if !unpublished || reminded {
+				return nil
+			}
+			reminded = true
+			emit(agentEvent{Type: "status", Text: "The model stopped before publishing, reminding it"})
+			sess.mu.Lock()
+			sess.messages = append(sess.messages, chatMessage{Role: "user",
+				Content: "The files you wrote are not published yet. Call publish now if the page is ready, otherwise say what is missing."})
+			sess.mu.Unlock()
+			continue
 		}
 
 		for _, call := range msg.ToolCalls {
 			emit(agentEvent{Type: "tool_call", Name: call.Function.Name, Arguments: call.Function.Arguments})
 			output, isError := s.runTool(ctx, sess, call, emit)
+			if !isError {
+				switch call.Function.Name {
+				case "write_file":
+					unpublished = true
+				case "publish":
+					unpublished = false
+				}
+			}
 			emit(agentEvent{Type: "tool_result", Name: call.Function.Name, Text: output, IsError: isError})
 			sess.mu.Lock()
 			sess.messages = append(sess.messages, chatMessage{Role: "tool", ToolCallID: call.ID, Content: output})
