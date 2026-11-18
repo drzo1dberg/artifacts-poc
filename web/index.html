@@ -29,18 +29,39 @@
     </nav>
 
     <section class="editor">
-      <div class="row">
-        <input id="title" placeholder="Title">
-        <label>Retention
-          <input id="retention" type="number" min="1" max="3650" value="30"> days
-        </label>
+      <div class="tabs" role="tablist">
+        <button id="tab-code" type="button" role="tab" aria-selected="true" aria-controls="code-pane">Code</button>
+        <button id="tab-agent" type="button" role="tab" aria-selected="false" aria-controls="agent-pane">Agent</button>
       </div>
-      <div class="row">
-        <select id="file-select" aria-label="File"></select>
-        <button id="add-file" type="button">Add file</button>
-        <button id="publish" type="button" class="primary">Publish</button>
+
+      <div id="code-pane" class="pane" role="tabpanel">
+        <div class="row">
+          <input id="title" placeholder="Title">
+          <label>Retention
+            <input id="retention" type="number" min="1" max="3650" value="30"> days
+          </label>
+        </div>
+        <div class="row">
+          <select id="file-select" aria-label="File"></select>
+          <button id="add-file" type="button">Add file</button>
+          <button id="publish" type="button" class="primary">Publish</button>
+        </div>
+        <textarea id="source" spellcheck="false" aria-label="Source"></textarea>
       </div>
-      <textarea id="source" spellcheck="false" aria-label="Source"></textarea>
+
+      <div id="agent-pane" class="pane" role="tabpanel" hidden>
+        <div class="row">
+          <span id="agent-session" class="muted">No session. Your first message starts a microVM.</span>
+          <button id="agent-end" type="button" disabled>End session</button>
+        </div>
+        <div id="agent-log" class="agent-log" aria-live="polite"></div>
+        <form id="agent-form" class="agent-form">
+          <textarea id="agent-input" rows="3" spellcheck="false" aria-label="Message to the agent"
+            placeholder="Describe the page you want, for example: a click counter with a table of squares"></textarea>
+          <button id="agent-send" class="primary">Send</button>
+        </form>
+      </div>
+
       <p id="status" role="status"></p>
     </section>
 
@@ -56,6 +77,7 @@
         <dt>Front door URL</dt><dd id="content-url">–</dd>
         <dt>Expires</dt><dd id="expires">–</dd>
         <dt>postMessage</dt><dd id="bridge-log">–</dd>
+        <dt>Sandbox egress</dt><dd id="egress-log">–</dd>
       </dl>
     </section>
   </div>

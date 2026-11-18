@@ -1,10 +1,12 @@
 # artifacts-poc
 
-My learning project: how would you build something like Claude Artifacts, where a user publishes a web page and the platform runs it safely?
+My learning project: how would you build something like Claude Artifacts, where a user publishes a web page and the platform runs it safely? And how does an agent fit in that writes such a page by running code on the server?
 
 I wanted to understand the systems design, so I rebuilt the idea locally with Docker and no cloud services. I built it together with Claude Code. This is a POC with a fake login, not something to deploy.
 
 ![The app with the sandbox demo open](docs/screenshot.png)
+
+![The agent tab: the model wrote, checked, and published a clock page from inside a microVM](docs/agent.png)
 
 ## Run it
 
@@ -14,7 +16,12 @@ cd artifacts-poc
 docker compose up -d --build
 ```
 
-The `sandboxd` service runs Firecracker microVMs, so the host needs KVM: `/dev/kvm` must exist. Then open <http://app.localhost:8080>. Chrome and Firefox resolve `*.localhost` on their own, Safari does not. To remove everything including data, run `docker compose down -v`.
+The host needs two devices:
+
+- `/dev/kvm` for the Firecracker microVMs of `sandboxd`.
+- `/dev/dri` for the GPU that Ollama uses through Vulkan. I use an AMD Radeon RX 9060 XT with 16 GB VRAM.
+
+The first start downloads the model `qwen3.5:9b`, which is 6.6 GB. Then open <http://app.localhost:8080>. Chrome and Firefox resolve `*.localhost` on their own, Safari does not. To remove everything including data, run `docker compose down -v`.
 
 ## The one idea that explains the design
 
@@ -40,10 +47,15 @@ An artifact is untrusted code that runs next to your logged-in session. Without 
          ┌──────────────┘   │   └─────────────────┐
       ┌──┴──┐  /api/   ┌────┴───┐    writes    ┌───┴───────┐
       │ web │          │  api   │ ───────────► │ blobstore │
-      └─────┘          └────┬───┘              └───────────┘
-                       ┌────┴─────┐            ┌───────────┐
-                       │ postgres │            │ sandboxd  │  one Firecracker microVM per sandbox
-                       └──────────┘            └───────────┘
+      └─────┘          └─┬──┬─┬─┘              └───────────┘
+                         │  │ └──────────────────────┐
+              ┌──────────┘  └──────┐                 │ tool calls
+         ┌────┴─────┐        ┌─────┴──────┐    ┌─────┴─────┐
+         │ postgres │        │ llmgateway │    │ sandboxd  │  one Firecracker microVM per sandbox
+         └──────────┘        └─────┬──────┘    └───────────┘
+                               ┌───┴────┐
+                               │ ollama │  qwen3.5:9b on the GPU
+                               └────────┘
 ```
 
 | Service | Built with | Job | Code |
@@ -53,6 +65,9 @@ An artifact is untrusted code that runs next to your logged-in session. Without 
 | `api` | Go, pgx | Control plane and retention job | `api/main.go`, `api/blob.go`, `api/token.go` |
 | `postgres` | PostgreSQL 17 | Metadata | `api/schema.sql` |
 | `sandboxd` | Go, Firecracker | Simulated ACA Sandboxes: microVMs for untrusted agent code | `sandboxd/` |
+| `llmgateway` | LiteLLM | Simulated Azure AI Foundry: an OpenAI compatible endpoint with a key | `llmgateway/config.yaml` |
+| `ollama` | Ollama with Vulkan | Runs the model on the GPU | `docker-compose.yml` |
+| `models` | Ollama CLI | One-shot job: downloads the model and sets a 32k context | `docker-compose.yml` |
 | `web` | TypeScript, no framework | Editor and preview | `web/src/main.ts` |
 
 Each user gets one container, each artifact is a folder, and each version is a subfolder:
@@ -125,6 +140,53 @@ The default is 30 days per artifact, and every publish restarts the clock. `purg
 - **`FOR UPDATE SKIP LOCKED`** skips artifacts that a publish is working on.
 - **Deleted means gone.** The API refuses the read even if the file is still in the edge cache, and the cached copy expires within 60 seconds.
 
+## The agent
+
+The **Agent** tab takes a request like "a click counter with a table of squares". The model writes the files, runs `python3` to generate data or check its work, and publishes the result as a new version of an artifact.
+
+### Where the loop runs
+
+There are two common designs for an agent with a sandbox:
+
+1. **The whole agent runs in the sandbox.** The harness, its tools, and its calls to the model all run in the VM, and an egress proxy keeps credentials outside. Claude Code on the web runs each session in an isolated VM like this.
+2. **The loop runs in the backend, and only tool calls run in the sandbox.** The backend calls the model, and when the model asks for a tool, the backend runs it in the VM. The exec and file operations of ACA Sandboxes are made for this.
+
+This project uses the second design, because the app itself should make the call to the model. `runAgent` in `api/agent.go` does this:
+
+```
+1. send the history and four tools to llmgateway   POST /v1/chat/completions
+2. the model answers with tool calls               write_file, read_file, run_command, publish
+3. run each one in this session's microVM          sandboxd exec and files
+4. append the results, go to 1                     at most 16 steps
+5. no more tool calls                              the answer is final
+```
+
+Every step goes to the browser as one line of JSON while the loop runs. The front door turns off response buffering for `/api/agent/`, otherwise the lines would arrive all at once at the end.
+
+The VM holds no API key and no session cookie. Whatever the model writes there can only reach the outside through the egress policy, and the agent sessions get none: an attempt to `pip install` something fails, shows up in the decision log, and the model reads the error like any other tool result.
+
+### Publishing from the sandbox
+
+`publish` copies `/workspace/site` out of the VM and runs the same code as the editor: `insertArtifact` for the first version, then `publishFiles` with `base_version` set to the version this session published last. If someone changes the artifact in the editor in the meantime, the agent gets the conflict as a tool result instead of silently overwriting that change.
+
+### Sessions
+
+Each session gets its own microVM. After 60 seconds without a tool call, `sandboxd` suspends it with a memory snapshot, and the next message resumes it in about 25 ms with all files intact. After 30 idle minutes, both the session and the VM are deleted. A user can have at most two sessions.
+
+### The model
+
+The model is `qwen3.5:9b`. Among the models that fit into 16 GB of VRAM, it is the strongest at agent tasks: [Artificial Analysis](https://artificialanalysis.ai/models/qwen3-5-9b) lists 87 % on τ²-Bench, against 36 % for `gemma4:12b`. Ollama runs it through Vulkan, which generated about 30 % more tokens per second than ROCm on this card in my own comparison.
+
+The api only knows an endpoint, a key, and the model name `agent`. LiteLLM maps that name to Ollama, so moving to Azure AI Foundry is a change in `llmgateway/config.yaml`, not in the code. The file has a commented example.
+
+| Measured on the RX 9060 XT | Time |
+|---|---|
+| One step with thinking, depending on how long the model thinks | 1 to 27 s |
+| The same first step with `AGENT_REASONING_EFFORT: none` | about 3 s instead of 11 s |
+| A whole page, from request to preview | 30 to 45 s |
+
+A 9B model is a weak agent compared to a frontier model. Small pages work reliably. Long tasks with many steps go wrong more often.
+
 ## Sandboxes for agent code
 
 Artifacts run in the browser. An agent also needs a place to run code on the server: it writes files, runs `python3`, and installs packages. That code is just as untrusted as an artifact, and a container is not enough of a boundary for it, because containers share the host kernel. Cloud agent products therefore run tool calls in a microVM with its own kernel. On Azure, that's [Azure Container Apps Sandboxes](https://sandboxes.azure.com/docs/sandboxes/), which reached general availability in September 2026.
@@ -185,6 +247,8 @@ docker compose exec postgres psql -U artifacts -c \
 
 **Login gate:** copy the front door URL shown in the app and open it in a new tab. You get a 403, because only the iframe in the app may show it. Remove the token from the URL and you get a 404.
 
+**Agent:** log in, open the **Agent** tab, and ask for a page. Then ask for a change: the agent publishes it as the next version. Ask it to install a package with `pip`, and the **Sandbox egress** line shows the denied connection.
+
 **MicroVM:** create a sandbox, run code in it, and watch the egress policy work:
 
 ```bash
@@ -213,6 +277,7 @@ I have not deployed this. The mapping comes from reading the Microsoft Learn doc
 | fake login | Entra ID, assuming all users are internal, and a signed session cookie |
 | retention job | Container Apps job, plus a lifecycle policy as a safety net |
 | sandboxd | Container Apps Sandboxes: a sandbox group, the `python-3.13` disk image, and an egress policy per sandbox |
+| llmgateway and ollama | Azure AI Foundry with a model deployment, called by the API with a managed identity |
 
 The interesting part is what does not map one to one:
 
@@ -278,6 +343,8 @@ Everything behind that is my own model. How Anthropic stores, routes and retains
 - Every publish sends all files, and only text files work, because they travel as JSON strings.
 - A publish holds a database lock during the upload. It is correct but does not scale. A real version would upload under a random ID first and then move the pointer with `UPDATE ... WHERE live_version = base`.
 - The database password in `docker-compose.yml` is a local development value. Postgres has no published port.
+- The api keeps agent sessions in memory. A restart loses them, and the next message starts a new microVM.
+- One GPU serves every user, and Ollama answers one request at a time.
 - `sandboxd` keeps its sandboxes in memory. A restart of the service deletes all of them.
 - Firecracker runs without its `jailer`, so the VMM processes run as root in the `sandboxd` container instead of in a chroot with their own user and cgroup.
-- The egress proxy only knows HTTP and HTTPS through `HTTP_PROXY`. A program that ignores the proxy variables simply has no network.
+- The egress proxy only knows HTTP and HTTPS through `HTTP_PROXY`. A program that ignores the proxy variables has no network.
