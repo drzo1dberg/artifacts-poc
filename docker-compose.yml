@@ -34,6 +34,24 @@ services:
     volumes:
       - blobdata:/data
 
+  # Stands in for Azure Container Apps Sandboxes: one Firecracker microVM per sandbox.
+  # Needs /dev/kvm on the host. Reachable only from inside the compose network.
+  sandboxd:
+    build: ./sandboxd
+    devices:
+      - /dev/kvm
+    environment:
+      # Local development value. On Azure this would be Entra ID with a data plane role.
+      SANDBOXD_TOKEN: local-development-only
+      MAX_SANDBOXES: 4
+      # A demo secret for egress rules with action Transform: {secret:DEMO} in a header value.
+      # The VM never sees it, the egress proxy adds it on the way out.
+      SANDBOX_SECRET_DEMO: local-demo-secret
+    volumes:
+      - sandboxdata:/data
+    security_opt:
+      - no-new-privileges:true
+
   postgres:
     image: postgres:17-alpine
     environment:
@@ -50,5 +68,6 @@ services:
       retries: 30
 
 volumes:
+  sandboxdata:
   blobdata:
   pgdata:

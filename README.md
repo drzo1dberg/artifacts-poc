@@ -14,7 +14,7 @@ cd artifacts-poc
 docker compose up -d --build
 ```
 
-Then open <http://app.localhost:8080>. Chrome and Firefox resolve `*.localhost` on their own, Safari does not. To remove everything including data, run `docker compose down -v`.
+The `sandboxd` service runs Firecracker microVMs, so the host needs KVM: `/dev/kvm` must exist. Then open <http://app.localhost:8080>. Chrome and Firefox resolve `*.localhost` on their own, Safari does not. To remove everything including data, run `docker compose down -v`.
 
 ## The one idea that explains the design
 
@@ -41,9 +41,9 @@ An artifact is untrusted code that runs next to your logged-in session. Without 
       ┌──┴──┐  /api/   ┌────┴───┐    writes    ┌───┴───────┐
       │ web │          │  api   │ ───────────► │ blobstore │
       └─────┘          └────┬───┘              └───────────┘
-                       ┌────┴─────┐
-                       │ postgres │  users, artifacts, versions, retention
-                       └──────────┘
+                       ┌────┴─────┐            ┌───────────┐
+                       │ postgres │            │ sandboxd  │  one Firecracker microVM per sandbox
+                       └──────────┘            └───────────┘
 ```
 
 | Service | Built with | Job | Code |
@@ -52,6 +52,7 @@ An artifact is untrusted code that runs next to your logged-in session. Without 
 | `blobstore` | Go, standard library | Simulated storage account | `blobstore/main.go` |
 | `api` | Go, pgx | Control plane and retention job | `api/main.go`, `api/blob.go`, `api/token.go` |
 | `postgres` | PostgreSQL 17 | Metadata | `api/schema.sql` |
+| `sandboxd` | Go, Firecracker | Simulated ACA Sandboxes: microVMs for untrusted agent code | `sandboxd/` |
 | `web` | TypeScript, no framework | Editor and preview | `web/src/main.ts` |
 
 Each user gets one container, each artifact is a folder, and each version is a subfolder:
@@ -124,6 +125,49 @@ The default is 30 days per artifact, and every publish restarts the clock. `purg
 - **`FOR UPDATE SKIP LOCKED`** skips artifacts that a publish is working on.
 - **Deleted means gone.** The API refuses the read even if the file is still in the edge cache, and the cached copy expires within 60 seconds.
 
+## Sandboxes for agent code
+
+Artifacts run in the browser. An agent also needs a place to run code on the server: it writes files, runs `python3`, and installs packages. That code is just as untrusted as an artifact, and a container is not enough of a boundary for it, because containers share the host kernel. Cloud agent products therefore run tool calls in a microVM with its own kernel. On Azure, that's [Azure Container Apps Sandboxes](https://sandboxes.azure.com/docs/sandboxes/), which reached general availability in September 2026.
+
+`sandboxd` rebuilds that model locally with [Firecracker](https://github.com/firecracker-microvm/firecracker), the VMM behind AWS Lambda:
+
+```
+api ──HTTP──► sandboxd ──Unix socket──► firecracker ──vsock──► sandbox-agent (PID 1 in the VM)
+                  ▲                                                 │
+                  └──── egress proxy ◄── vsock ◄── 127.0.0.1:3128 ◄─┘ HTTP_PROXY of every command
+```
+
+- **Each sandbox is a VM with its own kernel.** A disk image is a normal container image, here `python:3.13-slim`, with a small agent as `/sbin/sandbox-agent`. On startup, `sandboxd` turns it into an ext4 file with `mkfs.ext4 -d`, which needs neither root nor loop devices. Each sandbox boots from its own copy. On btrfs, that copy is a reflink and takes no time.
+- **The VM has no network card.** The host reaches the agent over vsock. Firecracker maps vsock to a Unix socket, so `sandboxd` needs no network rights at all, only `/dev/kvm`.
+- **All outbound traffic goes through the egress proxy.** Commands get `HTTP_PROXY` and `HTTPS_PROXY`, the agent forwards those connections over vsock, and `sandboxd` decides. The first matching rule wins, otherwise the default action applies. Private, loopback, and link-local addresses are always blocked, after DNS resolution, so even `default_action: Allow` can't reach `api`, `postgres`, or a metadata endpoint.
+- **Secrets stay outside.** A rule with action `Transform` sets headers on the way out. A value like `Bearer {secret:DEMO}` is filled in from the `SANDBOX_SECRET_DEMO` environment variable of `sandboxd`. The VM never sees it. As in ACA with partial traffic inspection, HTTPS is only checked by host name, so header changes only work for plain HTTP.
+- **Stop keeps the memory.** Stop pauses the VM, writes a full Firecracker snapshot of memory and devices, and ends the process. Resume loads it in a new process. Files in `/dev/shm` and running background processes survive this. A request to a stopped sandbox resumes it first.
+- **Idle sandboxes clean themselves up.** `auto_suspend_seconds` stops a sandbox after that much idle time and `auto_delete_seconds` deletes it.
+
+Measured on a Ryzen 7 3700X with btrfs:
+
+| Operation | Time |
+|---|---|
+| Create, from copy to agent ready | 640 ms |
+| Stop with a memory snapshot of 512 MiB | 800 ms |
+| Resume from the snapshot | 25 ms |
+| A command with `uname` and `python3` through exec | 65 ms |
+
+The API follows the operations of ACA Sandboxes. Microsoft documents those as CLI and SDK calls, not as REST paths, so the paths here are my own:
+
+| `sandboxd` | ACA Sandboxes CLI |
+|---|---|
+| `POST /sandboxes` with `disk`, `labels`, `lifecycle`, `egress` | `aca sandbox create --disk python-3.13 --label ...` |
+| `GET /sandboxes?label=key=value` | `aca sandbox list -l key=value` |
+| `POST /sandboxes/{id}/exec` | `aca sandbox exec --id ... -c "..."` |
+| `GET`, `PUT /sandboxes/{id}/files?path=...`, `GET /sandboxes/{id}/tree?path=...` | `aca sandbox fs cat`, `fs write`, `fs ls` |
+| `POST /sandboxes/{id}/stop`, `/resume` | `aca sandbox stop`, `resume` |
+| `PUT /sandboxes/{id}/lifecycle` | `aca sandbox lifecycle set` |
+| `PUT /sandboxes/{id}/egress`, `GET .../egress/decisions` | `aca sandbox egress set`, `egress decisions` |
+| `DELETE /sandboxes/{id}` | `aca sandbox delete` |
+
+One deliberate difference: in ACA, a sandbox without an egress policy has unrestricted outbound access. Here it has none.
+
 ## Try it
 
 **Sandbox:** log in, click "Load sandbox demo", then "Publish". The artifact tries to break out and reports the results in a table.
@@ -141,6 +185,18 @@ docker compose exec postgres psql -U artifacts -c \
 
 **Login gate:** copy the front door URL shown in the app and open it in a new tab. You get a 403, because only the iframe in the app may show it. Remove the token from the URL and you get a 404.
 
+**MicroVM:** create a sandbox, run code in it, and watch the egress policy work:
+
+```bash
+alias sb='docker compose exec sandboxd curl -sS -H "Authorization: Bearer local-development-only"'
+sb -d '{"disk":"python"}' localhost:8090/sandboxes                     # note the id
+sb -d '{"command":"uname -r; python3 -V"}' localhost:8090/sandboxes/ID/exec
+sb -d '{"command":"pip download -q requests -d /tmp"}' localhost:8090/sandboxes/ID/exec  # 403, no egress by default
+sb localhost:8090/sandboxes/ID/egress/decisions
+sb -X POST localhost:8090/sandboxes/ID/stop                              # memory snapshot
+sb -X DELETE localhost:8090/sandboxes/ID
+```
+
 **Edge cache:** run `curl -I -H "Sec-Fetch-Dest: iframe"` twice on that URL. You get `X-Cache-Status: MISS`, then `HIT`.
 
 ## How this would look on Azure
@@ -156,6 +212,7 @@ I have not deployed this. The mapping comes from reading the Microsoft Learn doc
 | postgres | Azure Database for PostgreSQL Flexible Server |
 | fake login | Entra ID, assuming all users are internal, and a signed session cookie |
 | retention job | Container Apps job, plus a lifecycle policy as a safety net |
+| sandboxd | Container Apps Sandboxes: a sandbox group, the `python-3.13` disk image, and an egress policy per sandbox |
 
 The interesting part is what does not map one to one:
 
@@ -221,3 +278,6 @@ Everything behind that is my own model. How Anthropic stores, routes and retains
 - Every publish sends all files, and only text files work, because they travel as JSON strings.
 - A publish holds a database lock during the upload. It is correct but does not scale. A real version would upload under a random ID first and then move the pointer with `UPDATE ... WHERE live_version = base`.
 - The database password in `docker-compose.yml` is a local development value. Postgres has no published port.
+- `sandboxd` keeps its sandboxes in memory. A restart of the service deletes all of them.
+- Firecracker runs without its `jailer`, so the VMM processes run as root in the `sandboxd` container instead of in a chroot with their own user and cgroup.
+- The egress proxy only knows HTTP and HTTPS through `HTTP_PROXY`. A program that ignores the proxy variables simply has no network.
