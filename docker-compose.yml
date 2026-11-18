@@ -35,8 +35,8 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       blobstore: { condition: service_started }
-      sandboxd: { condition: service_started }
-      llmgateway: { condition: service_started }
+      sandboxd: { condition: service_healthy }
+      llmgateway: { condition: service_healthy }
 
   # Stands in for a storage account: keeps blobs as files, reachable from outside only through the front door.
   blobstore:
@@ -61,6 +61,11 @@ services:
       - sandboxdata:/data
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs -H \"Authorization: Bearer $$SANDBOXD_TOKEN\" http://127.0.0.1:8090/disks"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   # Stands in for Azure AI Foundry: the model gateway the api calls. The api only knows this
   # endpoint, a key, and the model name "agent".
@@ -72,6 +77,12 @@ services:
       LITELLM_MASTER_KEY: local-development-only
     volumes:
       - ./llmgateway/config.yaml:/app/config.yaml:ro
+    # LiteLLM needs about 12 seconds to start. The api waits for it, so the first request works.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness')"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
     depends_on:
       models: { condition: service_completed_successfully }
 
