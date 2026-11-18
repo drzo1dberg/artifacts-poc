@@ -163,6 +163,8 @@ This project uses the second design, because the app itself should make the call
 
 Every step goes to the browser as one line of JSON while the loop runs. The front door turns off response buffering for `/api/agent/`, otherwise the lines would arrive all at once at the end.
 
+A single step can take more than a minute when the model writes a whole page. So the api requests the answer as a stream and sends a progress line every second, for example `Step 1: model is thinking · 4 s · 120 tokens`. Ollama streams thinking and text token by token, but sends a tool call in one piece once it is complete. While the model writes a tool call, the progress line can therefore only count seconds.
+
 The VM holds no API key and no session cookie. Whatever the model writes there can only reach the outside through the egress policy, and the agent sessions get none: an attempt to `pip install` something fails, shows up in the decision log, and the model reads the error like any other tool result.
 
 ### Publishing from the sandbox
@@ -183,9 +185,10 @@ The api only knows an endpoint, a key, and the model name `agent`. LiteLLM maps 
 |---|---|
 | One step with thinking, depending on how long the model thinks | 1 to 27 s |
 | The same first step with `AGENT_REASONING_EFFORT: none` | about 3 s instead of 11 s |
-| A whole page, from request to preview | 30 to 45 s |
+| Writing a 5 to 15 KB `index.html` in one tool call | 30 to 85 s |
+| A whole page, from request to preview | 30 to 90 s |
 
-A 9B model is a weak agent compared to a frontier model. Small pages work reliably. Long tasks with many steps go wrong more often.
+A 9B model is a weak agent compared to a frontier model. Small pages work reliably. Long tasks with many steps go wrong more often. Sometimes the model describes the page it wrote and stops without calling `publish`. In that case `runAgent` reminds it once, and the model then publishes or explains why it doesn't.
 
 ## Sandboxes for agent code
 
